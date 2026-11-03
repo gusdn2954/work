@@ -22,4 +22,4 @@ AI 도구(Codex, Claude)를 활용해 만들고 검증한 프로그램을 프로
 
 ## 월간 수요검토 에이전트 프로토타입
 
-[demand-review-prototype](./demand-review-prototype/) 폴더에 Python 소스와 실행 안내가 있습니다. LOTTE AX Challenge 2026 예선 기획안을 검증하기 위한 것이며, **모든 데이터는 가상**입니다.
+[demand-review-prototype](./demand-review-prototype/) 폴더에 Python 소스와 실행 안내가 있습니다. LOTTE AX Challenge 2026 예선 기획안을 검증하기 위한 것이며, **모든 데이터는 가상**입니다. 본선 준비에 맞춰 계속 갱신하는 진행 중 프로젝트입니다.

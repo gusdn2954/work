@@ -148,17 +148,13 @@ def fit_predict(train, test, cols, alpha=None):
     if HAS_LGB:
         params = dict(n_estimators=300, learning_rate=0.05, num_leaves=15, min_child_samples=10,
                       subsample=0.9, colsample_bytree=0.9, random_state=SEED, verbose=-1)
-        if alpha is None:
-            m = lgb.LGBMRegressor(objective="regression", **params)
-        else:
-            m = lgb.LGBMRegressor(objective="quantile", alpha=alpha, **params)
+        # 점예측도 분위수 손실의 50% 분위수(중앙값)로 학습
+        m = lgb.LGBMRegressor(objective="quantile", alpha=0.5 if alpha is None else alpha, **params)
         m.fit(X, y)
         return m.predict(test[cols])
     Xf, Tf = X.fillna(-1), test[cols].fillna(-1)
-    if alpha is None:
-        m = GradientBoostingRegressor(random_state=SEED, n_estimators=200, max_depth=3)
-    else:
-        m = GradientBoostingRegressor(loss="quantile", alpha=alpha, random_state=SEED, n_estimators=200, max_depth=3)
+    m = GradientBoostingRegressor(loss="quantile", alpha=0.5 if alpha is None else alpha,
+                                  random_state=SEED, n_estimators=200, max_depth=3)
     m.fit(Xf, y)
     return m.predict(Tf)
 
@@ -213,10 +209,23 @@ def calib_width(df):
     n = len(sc)
     return float(np.quantile(sc, min(1.0, np.ceil((n + 1) * 0.8) / n)))
 
-CALIB = {h: calib_width(BT[(BT.period == "모델선택") & (BT.h == h)]) for h in (1, 2, 3)}
+# 시간 누수 차단: 예측 시점 o의 보정값은 '납기 월 < o', 즉 o 시점에 실적이 이미 확인된 과거 오차만으로 계산
+MIN_CALIB_N = 12
+
+
+def calib_at(origin, h):
+    past = BT[(BT.h == h) & (BT.target < origin)]
+    if len(past) < MIN_CALIB_N:
+        return 0.0  # 확인된 오차가 부족하면 보정하지 않음
+    return calib_width(past)
+
+
+BT["calib"] = [calib_at(o, h) for o, h in zip(BT.origin, BT.h)]
+REVIEW_ORIGIN_CALIB = pd.Period("2026-10", "M")
+CALIB = {h: calib_at(REVIEW_ORIGIN_CALIB, h) for h in (1, 2, 3)}  # 검토 시점 보정값
 BT["q10_raw"], BT["q90_raw"] = BT.q10, BT.q90
-BT["q10"] = BT.q10 - BT.h.map(CALIB)
-BT["q90"] = BT.q90 + BT.h.map(CALIB)
+BT["q10"] = BT.q10 - BT.calib
+BT["q90"] = BT.q90 + BT.calib
 BT["linked"] = BT.item.map(lambda i: LINK0[i] is not None)
 
 summ = []
@@ -244,7 +253,11 @@ LINK_EFF = pd.DataFrame(link_eff)
 # ---------------------------------------------------------------------------
 # 4) 거래처별 FCST 신뢰도 이력 (최근 6개 시점, 1개월 앞 기준)
 # ---------------------------------------------------------------------------
-recent = BT[(BT.origin.isin(FINAL_ORIGINS)) & (BT.h == 1)].copy()
+# 검토 기준월(REVIEW_ORIGIN_REL) 시점에 실적이 마감된 납기 월만 사용: 납기 월 < 검토 기준월, 최근 6개 회차
+REVIEW_ORIGIN_REL = pd.Period("2026-10", "M")
+_closed = BT[(BT.h == 1) & (BT.target < REVIEW_ORIGIN_REL)]
+_last6 = sorted(_closed.origin.unique())[-6:]
+recent = _closed[_closed.origin.isin(_last6)].copy()
 recent["거래처"] = recent.item.str.split("-").str[0]
 rel = []
 for d, g in recent.groupby("거래처"):
@@ -327,7 +340,7 @@ def review(link_table, label):
     te = build([REVIEW_ORIGIN], True, link_table, with_target=False)
     te["모델예측"] = fit_predict(tr, te, sig_cols)
     te["구간하단"] = np.minimum(fit_predict(tr, te, sig_cols, alpha=0.1), te["모델예측"]) - te.h.map(CALIB)
-    te["구간상단"] = np.maximum(fit_predict(tr, te, sig_cols, alpha=0.9), te["모델예측"]) + te.h.map(CALIB)
+    te["구간상단"] = np.maximum(fit_predict(tr, te, sig_cols, alpha=0.9), te["모델예측"]) + te.h.map(CALIB)  # CALIB: 검토 기준월 이전 확인 오차만
     te["고객FCST"] = [customer_fcst(i, tg, REVIEW_ORIGIN) for i, tg in zip(te.item, te.target)]
     te["접수주문"] = te["accepted"]
     ev = classify_all(link_table)
@@ -397,7 +410,7 @@ for it, ec, who, when in ANSWERS:
                       "출처": "확인 질문 답변"})
     LINK1[it] = ec
 CHANGELOG = pd.DataFrame(changelog)
-sheet2, ev2 = review(LINK1, "2회차(답변 저장 후)")
+sheet2, ev2 = review(LINK1, "답변 저장 후 재실행")
 rate2 = link_rate(LINK1)
 
 ev_compare = ev1.merge(ev2[["이벤트", "품목", "분류"]], on=["이벤트", "품목"], how="outer",
@@ -434,7 +447,7 @@ with pd.ExcelWriter(xlsx) as w:
     sheet1.to_excel(w, sheet_name="3_검토표_1회차", index=False)
     ev_compare.to_excel(w, sheet_name="4_근거분류_답변전후", index=False)
     CHANGELOG.to_excel(w, sheet_name="5_연결표_변경이력", index=False)
-    sheet2.to_excel(w, sheet_name="6_검토표_2회차", index=False)
+    sheet2.to_excel(w, sheet_name="6_검토표_답변후재실행", index=False)
     REL.to_excel(w, sheet_name="7_FCST신뢰도이력", index=False)
     POST.to_excel(w, sheet_name="8_사후평가_모의승인", index=False)
 
@@ -447,7 +460,7 @@ lines = []
 lines.append("월간 수요검토 에이전트 미니 프로토타입 (가상 데이터)")
 lines.append(f"예측 모델: {'LightGBM' if HAS_LGB else 'scikit-learn GradientBoosting (LightGBM 대체)'}")
 lines.append("")
-lines.append("[1] 백테스트 (최종평가 구간, 모델 선택에 쓰지 않은 마지막 6개 시점)")
+lines.append("[1] 백테스트 (최종평가 구간, 모델 선택에 쓰지 않은 마지막 6개 시점. 구간 보정값은 각 예측 시점에 실적이 확인된 과거 오차만으로 계산)")
 for _, r in SUMMARY[SUMMARY.구간 == "최종평가"].iterrows():
     lines.append(f"  {int(r['예측거리(개월)'])}개월 앞: WAPE 기준모델 {pct(r.WAPE_기준모델)}, 주모델(주문이력만) {pct(r.WAPE_LGB_주문이력만)}, "
                  f"주모델(신호추가) {pct(r.WAPE_LGB_신호추가)}, 고객FCST {pct(r.WAPE_고객FCST)} | 구간 포함률 보정 전 {pct(r.구간포함률_보정전)} -> 보정 후 {pct(r['구간포함률_보정후(목표80%)'])}")
@@ -463,11 +476,11 @@ for _, r in top.iterrows():
     lines.append(f"  - {r.품목} {r.납기월}: {r.검토사유} | FCST {r.고객FCST} vs 모델 {r.모델예측} ({r['구간(10~90%)']}) | {r.FCST신뢰도이력}")
 lines.append("[4] 연결 지도 성장")
 lines.append(f"  연결률(직전월 주문량 기준): 답변 전 {pct(rate1)} -> 답변 저장 후 {pct(rate2)}")
-lines.append(f"  2회차 검토표: 검토 {(sheet2.상태 == '검토').sum()}건")
+lines.append(f"  답변 저장 후 같은 기준월 재실행 검토표: 검토 {(sheet2.상태 == '검토').sum()}건")
 moved = ev_compare[(ev_compare.분류_답변전 == "연결 부족") & (ev_compare.분류_답변후 == "채택")]
 for _, r in moved.iterrows():
     lines.append(f"  {r.이벤트} x {r.품목}: 연결 부족 -> 채택")
-lines.append("[5] 거래처별 FCST 신뢰도 이력 (최종평가 6개 회차, 1개월 앞)")
+lines.append("[5] 거래처별 FCST 신뢰도 이력 (2026-10 검토 시점에 마감된 최근 6개 회차, 1개월 앞)")
 for _, r in REL.iterrows():
     lines.append(f"  {r.거래처}: 최근 {int(r.회차)}회차 {int(r.건수)}건, 평균 오차 {r['평균오차(부호)']:+.0%}, 과대 {r['과대건수(+15%초과)']}건, 과소 {r['과소건수(-15%미만)']}건")
 lines.append("[6] 사후 평가 (모의 승인: FCST가 구간 밖이면 모델값으로 조정)")

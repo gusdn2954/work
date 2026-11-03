@@ -416,3 +416,27 @@ def inventory_sim(bt, choice):
         rows.append({"계획 기준": name, "WAPE": wape(f.y, f[col]), "초과생산_톤": over, "부족_톤": under,
                      "초과_재고일수": over / months / daily, "부족_일수": under / months / daily})
     return pd.DataFrame(rows)
+
+
+SHORT_COST = 1.5  # 부족 1톤의 비용을 초과 재고 1톤의 1.5배로 가정 (결품, 긴급 생산)
+
+
+def choose_plan_factor(bt, choice, factors=(0.95, 1.0, 1.05, 1.10, 1.15)):
+    """생산 기준값 = 시작값 x 계수. 모델 선택 구간에서 초과 + 1.5 x 부족이 가장 작은 계수를 고른다 (1개월 앞)"""
+    f = bt[(bt.period == "모델선택") & (bt.h == 1)].copy()
+    f["p_start"] = start_value(f, choice)
+    cost = {k: float((f.p_start * k - f.y).clip(lower=0).sum() + SHORT_COST * (f.y - f.p_start * k).clip(lower=0).sum()) for k in factors}
+    return min(cost, key=cost.get), cost
+
+
+def inventory_sim2(bt, choice, k):
+    f = bt[(bt.period == "최종평가") & (bt.h == 1)].copy()
+    f["p_start"] = start_value(f, choice)
+    f["p_plan"] = f.p_start * k
+    months = f.origin.nunique(); daily = f.y.sum() / months / 30
+    rows = []
+    for name, col in [("고객 FCST", "fcst"), ("선택한 시작값", "p_start"), (f"생산 기준값(x{k:.2f})", "p_plan")]:
+        over = float((f[col] - f.y).clip(lower=0).sum()); under = float((f.y - f[col]).clip(lower=0).sum())
+        rows.append({"계획 기준": name, "초과_재고일수": over / months / daily, "부족_일수": under / months / daily,
+                     "비용지수(초과+1.5x부족)": (over + SHORT_COST * under) / months / daily})
+    return pd.DataFrame(rows)

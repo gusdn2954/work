@@ -115,6 +115,11 @@ BASE_COLS = ["item_code", "dtype_code", "fam_code", "h", "target_month", "lag1",
 SIG_COLS = BASE_COLS + ["sig_last", "sig_chg3"]
 CORR_COLS = SIG_COLS + ["dist_code", "fcst", "fcst_ratio"]
 NOACC_COLS = [c for c in SIG_COLS if c not in ("accepted", "acc_ratio")]  # 비교 실험: 접수 주문을 뺀 모델
+import os as _os
+if _os.environ.get("DEMAND_NOACC") == "1":  # 현장 시나리오: 예측 시점 기준 접수 주문 이력을 복원할 수 없음
+    BASE_COLS = [c for c in BASE_COLS if c not in ("accepted", "acc_ratio")]
+    SIG_COLS = NOACC_COLS
+    CORR_COLS = [c for c in CORR_COLS if c not in ("accepted", "acc_ratio")]
 
 
 def build(origins, link_table, with_target=True):
@@ -379,4 +384,35 @@ def eval_flags(bt, shares=(0.10, 0.20, 0.25, 0.30, 0.40), seed=0):
                 fl, _ = review_flag(g, sh, ref="p_champ")
                 m1[g.index] = fl
             stat("1단계 규칙: 독립 예측 차이 상위", m1, sh)
+    return pd.DataFrame(rows)
+
+
+def choose_start(bt):
+    """제안 시작값을 예측 거리별로 모델 선택 구간에서 고른다: 독립 예측, AI 보정, 둘의 평균"""
+    sel = bt[bt.period == "모델선택"]
+    out, rows = {}, []
+    for h in (1, 2, 3):
+        s = sel[sel.h == h]
+        c = {"독립 예측": wape(s.y, s.p_champ), "AI 보정": wape(s.y, s.p_corr), "평균": wape(s.y, (s.p_champ + s.p_corr) / 2)}
+        out[h] = min(c, key=c.get)
+        rows.append({"예측거리": h, **c, "선택": out[h]})
+    return out, pd.DataFrame(rows)
+
+
+def start_value(df, choice):
+    ch = df.h.map(choice)
+    return np.where(ch == "독립 예측", df.p_champ, np.where(ch == "AI 보정", df.p_corr, (df.p_champ + df.p_corr) / 2))
+
+
+def inventory_sim(bt, choice):
+    """최종 평가 구간 1개월 앞: 각 값대로 다음 달 생산했다면 초과 생산과 부족이 얼마인가 (재고일수 = 월평균 초과량 / 일평균 수요)"""
+    f = bt[(bt.period == "최종평가") & (bt.h == 1)].copy()
+    f["p_start"] = start_value(f, choice)
+    months = f.origin.nunique()
+    daily = f.y.sum() / months / 30
+    rows = []
+    for name, col in [("고객 FCST", "fcst"), ("독립 예측", "p_champ"), ("AI 보정 FCST", "p_corr"), ("선택한 시작값", "p_start")]:
+        over = float((f[col] - f.y).clip(lower=0).sum()); under = float((f.y - f[col]).clip(lower=0).sum())
+        rows.append({"계획 기준": name, "WAPE": wape(f.y, f[col]), "초과생산_톤": over, "부족_톤": under,
+                     "초과_재고일수": over / months / daily, "부족_일수": under / months / daily})
     return pd.DataFrame(rows)

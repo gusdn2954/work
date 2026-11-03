@@ -61,6 +61,8 @@ F.CALIB_LEVEL, CALIB_TRIALS = F.choose_level(BT)   # 모델 선택 구간에서�
 BT = F.add_intervals(BT, BT)
 BT_SUMMARY = F.backtest_summary(BT)
 FLAG_EVAL = F.eval_flags(BT)
+START_CHOICE, START_TABLE = F.choose_start(BT)
+INV_SIM = F.inventory_sim(BT, START_CHOICE)
 PAT_SUMMARY = F.pattern_summary(BT)
 HIER = F.hierarchy_summary(BT)
 HIER = HIER[HIER.계층 != "계열"]  # 이 가상 데이터는 계열당 그레이드가 하나라 그레이드와 같음
@@ -599,7 +601,11 @@ EVL2 = hx.call("12 재실행", "근거연결", events=EVENTS_OK, link_table=LINK
 REV2 = hx.call("12 재실행", "검토표작성", fc=FC2, ev_link=EVL2)
 props, notes = [], []
 for _, r in REV2.iterrows():
-    v, nt = hx.call("12 재실행", "수량환산", base=r.AI보정FCST, accepted=r.접수주문, target=r.납기월, fact=FACTS.get(r.품목))
+    _h = (pd.Period(r.납기월, "M") - REVIEW_ORIGIN).n
+    _c = START_CHOICE[_h]
+    _base = r.AI보정FCST if _c == "AI 보정" else r.독립예측 if _c == "독립 예측" else round((r.AI보정FCST + r.독립예측) / 2, 1)
+    v, nt = hx.call("12 재실행", "수량환산", base=_base, accepted=r.접수주문, target=r.납기월, fact=FACTS.get(r.품목))
+    nt = nt.replace("AI 보정 FCST", {"AI 보정": "AI 보정 FCST", "독립 예측": "독립 예측", "평균": "독립 예측과 AI 보정 평균"}[_c])
     props.append(v)
     notes.append(nt)
 REV2["에이전트제안값"] = props
@@ -771,6 +777,8 @@ with pd.ExcelWriter(xlsx) as w:
     STRESS_T.to_excel(w, sheet_name="18_답변해석_스트레스시험", index=False)
     pd.DataFrame(CALIB_TRIALS, columns=["보정수준", "모델선택구간_포함률"]).to_excel(w, sheet_name="19_보정수준_선택", index=False)
     FLAG_EVAL.to_excel(w, sheet_name="20_예외선별_평가", index=False)
+    START_TABLE.to_excel(w, sheet_name="21_시작값_선택", index=False)
+    INV_SIM.to_excel(w, sheet_name="22_재고시뮬레이션", index=False)
     ANSWERS.to_excel(w, sheet_name="9_답변해석_LLM", index=False)
     pd.DataFrame(CHANGELOG).to_excel(w, sheet_name="10_연결표_변경이력", index=False)
     REMIND.to_excel(w, sheet_name="11_재질문_에스컬레이션", index=False)
@@ -803,6 +811,9 @@ L.append(f"  예외 선별(최종평가, 큰 오차 = 고객 FCST 오차 10톤 �
          f"v6 규칙 {_old.정밀도:.0%}, {_old.잡아낸오차비중:.0%} | 무작위 {_rnd.정밀도:.0%}, {_rnd.잡아낸오차비중:.0%} | 물량 상위 {_vol.정밀도:.0%}, {_vol.잡아낸오차비중:.0%}")
 L.append(f"  접수 주문을 뺀 LightGBM 1개월 앞 WAPE {pct(fin.iloc[0].WAPE_LGB_접수주문제외)} (기준 모델 {pct(fin.iloc[0].WAPE_기준모델)})")
 L.append(f"  데이터 모드: {V.DATA_MODE}")
+L.append("  제안 시작값(모델 선택 구간에서 선택): " + ", ".join(f"{h}개월 {c}" for h, c in START_CHOICE.items()))
+L.append("  재고 시뮬레이션(최종평가 1개월 앞, 그 값대로 생산했다면): " + " | ".join(
+    f"{r['계획 기준']} 초과 {r.초과생산_톤:.0f}톤({r.초과_재고일수:.1f}일), 부족 {r.부족_톤:.0f}톤({r.부족_일수:.1f}일)" for _, r in INV_SIM.iterrows()))
 L.append(f"  예측 범위 보정 수준 {F.CALIB_LEVEL:.2f} (모델 선택 구간 포함률: " + ", ".join(f"{a:.2f} -> {b:.1%}" for a, b in CALIB_TRIALS) + ")")
 L.append("  판단 기한용 MES 리드타임 80분위(일): " + ", ".join(f"{k} {v:g}" for k, v in LEAD80.items()))
 L.append("")

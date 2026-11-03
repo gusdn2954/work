@@ -223,6 +223,7 @@ def calib_at(origin, h):
 BT["calib"] = [calib_at(o, h) for o, h in zip(BT.origin, BT.h)]
 REVIEW_ORIGIN_CALIB = pd.Period("2026-10", "M")
 CALIB = {h: calib_at(REVIEW_ORIGIN_CALIB, h) for h in (1, 2, 3)}  # 검토 시점 보정값
+CALIB_N = {h: int(((BT.h == h) & (BT.target < REVIEW_ORIGIN_CALIB)).sum()) for h in (1, 2, 3)}
 BT["q10_raw"], BT["q90_raw"] = BT.q10, BT.q90
 BT["q10"] = BT.q10 - BT.calib
 BT["q90"] = BT.q90 + BT.calib
@@ -279,6 +280,8 @@ def rel_text(d):
 # 5) 근거 분류 (LLM 추출을 규칙으로 대신): 채택, 참고 보관, 시차 불명확, 연결 부족
 # ---------------------------------------------------------------------------
 REVIEW_ORIGIN = pd.Period("2026-10", "M")
+FORECAST_DATE = pd.Timestamp("2026-10-01")  # 예측 기준일: 모델 입력 신호는 이 날까지 공개된 자료만
+REVIEW_DATE = pd.Timestamp("2026-10-07")    # 검토일: 검토 근거는 이 날까지 공개된 자료만
 TARGETS = [REVIEW_ORIGIN + h for h in (1, 2, 3)]
 EVENTS = [  # 가상의 공개 실적, 뉴스 이벤트 (실제 기사 아님)
     {"id": "N1", "end_customer": "E_A", "direction": "하향", "effect_from": pd.Period("2026-11", "M"),
@@ -291,6 +294,8 @@ EVENTS = [  # 가상의 공개 실적, 뉴스 이벤트 (실제 기사 아님)
      "published": "2026-10-02", "text": "[가상] 완성차 B, 12월부터 주말 특근으로 생산 확대"},
     {"id": "N4", "end_customer": "E_X", "direction": "상향", "effect_from": pd.Period("2026-12", "M"),
      "published": "2026-10-03", "text": "[가상] 가전 X, 연말 판촉 확대 (연결표에 없는 기업)"},
+    {"id": "N6", "end_customer": "E_A", "direction": "하향", "effect_from": pd.Period("2026-11", "M"),
+     "published": "2026-10-12", "text": "[가상] 완성차 A, 11월 추가 감산 발표 (검토일 이후 공개, 제외되어야 함)"},
 ]
 
 
@@ -312,9 +317,15 @@ def classify(ev, item_row, link_table):
     return "채택"
 
 
-def classify_all(link_table):
+def usable_events(as_of):
+    """as_of 시점까지 공개된 이벤트만 반환 (미래 정보 차단)"""
+    return [e for e in EVENTS if pd.Timestamp(e["published"]) <= as_of]
+
+
+def classify_all(link_table, as_of=None):
+    as_of = REVIEW_DATE if as_of is None else as_of
     out = []
-    for ev in EVENTS:
+    for ev in usable_events(as_of):
         for _, r in ITEMS.iterrows():
             c = classify(ev, r, link_table)
             if c is None:
@@ -350,7 +361,10 @@ def review(link_table, label):
     for _, r in te.iterrows():
         d = r["item"].split("-")[0]
         reasons, questions, evidence = [], [], []
-        if r.고객FCST > r.구간상단:
+        low_conf = CALIB_N.get(int(r.h), 0) < MIN_CALIB_N  # 확인된 오차 표본이 부족하면 구간 참고
+        if low_conf:
+            pass  # 구간 참고: 구간 이탈만으로는 검토 사유로 쓰지 않음
+        elif r.고객FCST > r.구간상단:
             reasons.append("고객 FCST가 구간 상단 초과")
             questions.append("고객 FCST 상향 근거(신규 프로젝트, 재고 확충)가 있는가?")
         elif r.고객FCST < r.구간하단:
@@ -374,18 +388,20 @@ def review(link_table, label):
             status = "정상"
         else:
             status = "검토"
+        link_check = "필요" if len(miss_link) else "-"
         gap = abs(r.고객FCST - r.모델예측)
         weight = 1 + abs(REL_MAP.get(d, 0))
         start_value = r.고객FCST
         sheets.append({
             "검토회차": label, "기준월": str(REVIEW_ORIGIN), "품목": r["item"], "납기월": str(r.target),
-            "상태": status, "검토사유": "; ".join(reasons) if reasons else "-",
+            "상태": status, "연결확인": link_check, "구간신뢰": "구간 참고" if low_conf else "보정 구간",
+            "검토사유": "; ".join(reasons) if reasons else "-",
             "고객FCST": round(r.고객FCST, 1), "모델예측": round(r.모델예측, 1),
             "구간(10~90%)": f"{r.구간하단:.0f}~{r.구간상단:.0f}", "접수주문": round(r.접수주문, 1),
             "FCST신뢰도이력": rel_text(d), "근거": " | ".join(evidence) if evidence else "-",
             "확인질문": " / ".join(dict.fromkeys(questions)) if questions else "-",
             "검토시작값": round(start_value, 1), "판단": "", "승인값": "", "사유": "", "승인자": "", "승인시각": "",
-            "_정렬점수": gap * weight if status == "검토" else -1,
+            "_정렬점수": gap * weight if status == "검토" else (-0.5 if link_check == "필요" else -1),
         })
     sheet = pd.DataFrame(sheets).sort_values("_정렬점수", ascending=False).drop(columns="_정렬점수")
     return sheet, ev
@@ -463,12 +479,19 @@ lines.append("")
 lines.append("[1] 백테스트 (최종평가 구간, 모델 선택에 쓰지 않은 마지막 6개 시점. 구간 보정값은 각 예측 시점에 실적이 확인된 과거 오차만으로 계산)")
 for _, r in SUMMARY[SUMMARY.구간 == "최종평가"].iterrows():
     lines.append(f"  {int(r['예측거리(개월)'])}개월 앞: WAPE 기준모델 {pct(r.WAPE_기준모델)}, 주모델(주문이력만) {pct(r.WAPE_LGB_주문이력만)}, "
-                 f"주모델(신호추가) {pct(r.WAPE_LGB_신호추가)}, 고객FCST {pct(r.WAPE_고객FCST)} | 구간 포함률 보정 전 {pct(r.구간포함률_보정전)} -> 보정 후 {pct(r['구간포함률_보정후(목표80%)'])}")
-lines.append("[2] 신호 효과 (최종평가 구간)")
+                 f"주모델(생산지수추가) {pct(r.WAPE_LGB_신호추가)}, 고객FCST {pct(r.WAPE_고객FCST)} | 구간 포함률 보정 전 {pct(r.구간포함률_보정전)} -> 보정 후 {pct(r['구간포함률_보정후(목표80%)'])}")
+lines.append("[2] 가상 최종 고객 생산지수 효과 (최종평가 구간)")
 for _, r in LINK_EFF.iterrows():
     lines.append(f"  {r.최종고객연결}: 주문이력만 {pct(r.WAPE_LGB_주문이력만)} -> 신호추가 {pct(r.WAPE_LGB_신호추가)}")
 n_review = (sheet1.상태 == "검토").sum()
 lines.append(f"[3] 1회차 검토표: 전체 {len(sheet1)}건 중 검토 {n_review}건, 정상 {len(sheet1) - n_review}건 (구간 보정 폭: " + ", ".join(f"{h}개월 {CALIB[h]:.1f}톤" for h in (1, 2, 3)) + ")")
+n_link_normal = int(((sheet1.상태 == "정상") & (sheet1.연결확인 == "필요")).sum())
+n_lowconf = int((sheet1.구간신뢰 == "구간 참고").sum())
+lines.append(f"  수량 검토와 별도로, 정상이지만 연결 확인 질문이 있는 행 {n_link_normal}건 (정상 요약에서도 질문 유지), 구간 참고 {n_lowconf}건")
+late = [e["id"] for e in EVENTS if pd.Timestamp(e["published"]) > REVIEW_DATE]
+leaked = sorted(set(ev1.이벤트) & set(late))
+assert not leaked, f"검토일 이후 공개 근거가 사용됨: {leaked}"
+lines.append(f"  날짜 검사: 예측 기준일 {FORECAST_DATE.date()}, 검토일 {REVIEW_DATE.date()}, 검토일 이후 공개 근거 {', '.join(late)} 제외 확인 (통과)")
 for _, r in sheet1[sheet1.근거 != "-"].head(2).iterrows():
     lines.append(f"  * 근거 채택 예: {r.품목} {r.납기월}: {r.근거[:60]}...")
 top = sheet1[sheet1.상태 == "검토"].head(3)
@@ -488,7 +511,7 @@ for _, r in POST.iterrows():
     lines.append(f"  {int(r['예측거리(개월)'])}개월 앞: FCST {pct(r.WAPE_고객FCST)}, 모델 {pct(r.WAPE_모델)}, 모의승인 {pct(r.WAPE_모의승인값)} "
                  f"(조정 {int(r.조정한건수)}/{int(r.전체건수)}건)")
 lines.append("")
-lines.append(f"상세 결과: {xlsx}")
+lines.append("상세 결과: 같은 폴더의 검토_결과_가상데이터.xlsx")
 text = "\n".join(lines)
 with open(os.path.join(OUT, "실행_요약.txt"), "w", encoding="utf-8") as f:
     f.write(text)

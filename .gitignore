@@ -6,3 +6,4 @@ dist/
 *.spec
 .idea/
 .vscode/
+demand-review-prototype/output/

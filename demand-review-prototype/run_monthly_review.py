@@ -648,6 +648,29 @@ LOTPLAN = LOTPLAN.merge(MES_G[["그레이드", "lot크기_중앙값"]], on="그�
 LOTPLAN["예상_lot수"] = np.ceil(LOTPLAN.색상별_톤 / LOTPLAN.lot크기_중앙값).astype(int)
 LOTPLAN = LOTPLAN[["그레이드", "색상", "색상비중", "색상별_톤", "lot크기_중앙값", "예상_lot수"]]
 
+# 최종 고객별 수요 화면: 거래처 x 그레이드 예측을 연결표(답변 반영 후)로 묶는다. 연결 안 된 물량은 미귀속으로 따로 표시
+_ec = V.END_CUSTOMERS.set_index("code")
+_v = REV2.copy()
+_v["최종고객"] = _v.품목.map(lambda i: LINK1.get(i) or "미귀속")
+_v["산업"] = _v.최종고객.map(lambda c: _ec.loc[c, "산업"] if c in _ec.index else "미귀속")
+_v["최종고객명"] = _v.최종고객.map(lambda c: _ec.loc[c, "name"] if c in _ec.index else "미귀속(컴파운더, 대리점 경유 등)")
+_v["반폭"] = (_v.구간상단 - _v.구간하단) / 2
+EC_VIEW = (_v.groupby(["산업", "최종고객명", "납기월"]).agg(품목수=("품목", "nunique"), 고객FCST=("고객FCST", "sum"),
+           독립예측=("독립예측", "sum"), 에이전트제안값=("에이전트제안값", "sum"), 실적_가상=("실적", "sum"),
+           범위반폭=("반폭", lambda x: float(np.sqrt((x ** 2).sum()))))
+           .reset_index())
+EC_VIEW["80%범위(근사)"] = [f"{a - w:.0f}~{a + w:.0f}" for a, w in zip(EC_VIEW.독립예측, EC_VIEW.범위반폭)]
+EC_VIEW = EC_VIEW.drop(columns="범위반폭").round(1)
+_v["실적_가상"] = _v.실적
+IND_VIEW = _v.groupby(["산업", "납기월"])[["고객FCST", "독립예측", "에이전트제안값", "실적_가상"]].sum().round(1).reset_index()
+_v["제품군"] = _v.품목.map(lambda i: F.IT.loc[i, "제품군"])
+FAM_VIEW = (_v[_v.납기월 == str(TARGETS[0])].pivot_table(index="제품군", columns="산업", values="에이전트제안값", aggfunc="sum", fill_value=0)
+            .round(0))
+FAM_VIEW["합계"] = FAM_VIEW.sum(axis=1)
+_n = EC_VIEW[EC_VIEW.최종고객명 != "미귀속(컴파운더, 대리점 경유 등)"]
+EC_WAPE = {"고객FCST": F.wape(_n.실적_가상, _n.고객FCST), "에이전트제안값": F.wape(_n.실적_가상, _n.에이전트제안값)}
+UNATTR_SHARE = float(_v[_v.최종고객 == "미귀속"].독립예측.sum() / _v.독립예측.sum())
+
 LOG = pd.DataFrame(hx.log)
 llm_log = LOG[LOG.권한 == "LLM"]
 n_units = len(REV2)
@@ -779,6 +802,9 @@ with pd.ExcelWriter(xlsx) as w:
     FLAG_EVAL.to_excel(w, sheet_name="20_예외선별_평가", index=False)
     START_TABLE.to_excel(w, sheet_name="21_시작값_선택", index=False)
     INV_SIM.to_excel(w, sheet_name="22_재고시뮬레이션", index=False)
+    EC_VIEW.to_excel(w, sheet_name="23_최종고객별_수요", index=False)
+    IND_VIEW.to_excel(w, sheet_name="24_산업별_수요", index=False)
+    FAM_VIEW.to_excel(w, sheet_name="25_제품군x산업_다음달")
     ANSWERS.to_excel(w, sheet_name="9_답변해석_LLM", index=False)
     pd.DataFrame(CHANGELOG).to_excel(w, sheet_name="10_연결표_변경이력", index=False)
     REMIND.to_excel(w, sheet_name="11_재질문_에스컬레이션", index=False)
@@ -836,6 +862,12 @@ L.append(f"  질문 {len(QUESTIONS)}품목 발송 -> 답변 {int(ANSWERS.상태.
 L.append(f"  연결률 {pct(RATE1)} -> {pct(RATE2)} | 답변 반영 후: 승인만 남은 단위 {n_resolved}건, 직접 판단 {n_review2}건")
 for _, r in ANSWERS.iterrows():
     L.append(f"   - {r.품목}: {r.상태}, {r.get('사실', '-')}, 다음 행동 {r.다음행동}")
+L.append("")
+L.append("[3b] 최종 고객별 수요 (거래처 x 그레이드 예측을 연결표로 묶음, 답변 반영 후)")
+for _, r in EC_VIEW[EC_VIEW.납기월 == str(TARGETS[0])].iterrows():
+    L.append(f"  {r.산업} {r.최종고객명} {r.납기월}: 품목 {r.품목수}, 고객FCST {r.고객FCST:.0f}톤, 독립예측 {r.독립예측:.0f}톤({r['80%범위(근사)']}), 제안값 {r.에이전트제안값:.0f}톤, 가상 실적 {r.실적_가상:.0f}톤")
+L.append("  다음 달 제안값, 제품군 x 산업(톤): " + "; ".join(f"{fam} " + ", ".join(f"{c} {v:.0f}" for c, v in row.items()) for fam, row in FAM_VIEW.iterrows()))
+L.append(f"  미귀속 물량 비중(독립예측 기준) {UNATTR_SHARE:.0%} | 최종 고객 단위 3개월 WAPE: 고객FCST {EC_WAPE['고객FCST']:.1%}, 제안값 {EC_WAPE['에이전트제안값']:.1%}")
 L.append("")
 L.append("[4] 10월 회차 사후 평가 (가상 실적 2026-11 ~ 2027-01)")
 for _, r in POST.iterrows():

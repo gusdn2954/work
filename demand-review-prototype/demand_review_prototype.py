@@ -282,6 +282,9 @@ def rel_text(d):
 REVIEW_ORIGIN = pd.Period("2026-10", "M")
 FORECAST_DATE = pd.Timestamp("2026-10-01")  # 예측 기준일: 모델 입력 신호는 이 날까지 공개된 자료만
 REVIEW_DATE = pd.Timestamp("2026-10-07")    # 검토일: 검토 근거는 이 날까지 공개된 자료만
+# 판단 기한(가정): 납기 월 1일에서 그레이드별 생산 확정과 원료 구매 리드타임을 뺀 날짜
+LEAD_DAYS = {"G1": 21, "G2": 28, "G3": 42}
+SPARSE_MA6 = 5.0  # 최근 6개월 평균 주문이 이 값(톤) 미만이면 주문이 드문 품목으로 보고 구간 참고
 TARGETS = [REVIEW_ORIGIN + h for h in (1, 2, 3)]
 EVENTS = [  # 가상의 공개 실적, 뉴스 이벤트 (실제 기사 아님)
     {"id": "N1", "end_customer": "E_A", "direction": "하향", "effect_from": pd.Period("2026-11", "M"),
@@ -315,6 +318,16 @@ def classify(ev, item_row, link_table):
     if ev["effect_from"] > TARGETS[-1]:
         return "참고 보관"  # 예측 기간 밖
     return "채택"
+
+
+PREBUY_SIG_CHG = 0.03  # 최근 3개월 최종 고객 생산지수 변화가 이 값보다 작으면 생산으로 설명되지 않는 주문으로 봄
+
+
+def prebuy_question(sig_chg3):
+    """접수 주문이 모델보다 많을 때 호출. 최종 고객 생산 변화가 작으면 선구매 여부 질문을 만든다."""
+    if pd.notna(sig_chg3) and abs(sig_chg3) < PREBUY_SIG_CHG:
+        return "[선구매 확인] 최종 고객 생산지수 변화가 작은데 접수 주문이 모델보다 많다. 가격 기대에 따른 선구매인가?"
+    return None
 
 
 def usable_events(as_of):
@@ -361,7 +374,11 @@ def review(link_table, label):
     for _, r in te.iterrows():
         d = r["item"].split("-")[0]
         reasons, questions, evidence = [], [], []
-        low_conf = CALIB_N.get(int(r.h), 0) < MIN_CALIB_N  # 확인된 오차 표본이 부족하면 구간 참고
+        low_conf = CALIB_N.get(int(r.h), 0) < MIN_CALIB_N or r.ma6 < SPARSE_MA6  # 오차 표본 부족, 드문 주문이면 구간 참고
+        grade = r["item"].split("-")[1]
+        deadline = r.target.start_time - pd.Timedelta(days=LEAD_DAYS[grade])
+        fixed = REVIEW_DATE > deadline  # 판단 기한이 지나 생산과 원료가 이미 확정된 구간
+        width = r.구간상단 - r.구간하단
         if low_conf:
             pass  # 구간 참고: 구간 이탈만으로는 검토 사유로 쓰지 않음
         elif r.고객FCST > r.구간상단:
@@ -373,6 +390,9 @@ def review(link_table, label):
         if r.모델예측 < r.접수주문:
             reasons.append("모델 예측이 접수 주문보다 낮음")
             questions.append("접수 주문 중 취소나 납기 이연 가능 물량이 있는가?")
+            pq = prebuy_question(r.sig_chg3)
+            if pq:
+                questions.append(pq)
         hit = adopted[(adopted.품목 == r["item"]) & (adopted.이벤트.isin([e["id"] for e in EVENTS
                                                                      if e["effect_from"] is not None and e["effect_from"] <= r.target]))]
         for _, h in hit.iterrows():
@@ -384,26 +404,31 @@ def review(link_table, label):
             questions.append(f"[연결 확인] {r['item']}의 최종 고객은 누구인가? (관련 가능 이벤트: {', '.join(miss_link.이벤트)})")
         for _, mrow in ev[(ev.품목 == r["item"]) & (ev.분류 == "시차 불명확")].iterrows():
             questions.append(f"[시차 확인] {mrow.이벤트}의 영향 시점은 언제인가?")
+        gap = abs(r.고객FCST - r.모델예측)
         if not reasons:
             status = "정상"
+        elif fixed and gap <= width:
+            status = "확정 구간"  # 판단 기한이 지났고 차이가 구간 폭 이내면 알림만 남김
         else:
             status = "검토"
         link_check = "필요" if len(miss_link) else "-"
-        gap = abs(r.고객FCST - r.모델예측)
         weight = 1 + abs(REL_MAP.get(d, 0))
         start_value = r.고객FCST
         sheets.append({
             "검토회차": label, "기준월": str(REVIEW_ORIGIN), "품목": r["item"], "납기월": str(r.target),
-            "상태": status, "연결확인": link_check, "구간신뢰": "구간 참고" if low_conf else "보정 구간",
+            "상태": status, "판단기한": str(deadline.date()), "연결확인": link_check, "구간신뢰": "구간 참고" if low_conf else "보정 구간",
             "검토사유": "; ".join(reasons) if reasons else "-",
             "고객FCST": round(r.고객FCST, 1), "모델예측": round(r.모델예측, 1),
             "구간(10~90%)": f"{r.구간하단:.0f}~{r.구간상단:.0f}", "접수주문": round(r.접수주문, 1),
             "FCST신뢰도이력": rel_text(d), "근거": " | ".join(evidence) if evidence else "-",
             "확인질문": " / ".join(dict.fromkeys(questions)) if questions else "-",
             "검토시작값": round(start_value, 1), "판단": "", "승인값": "", "사유": "", "승인자": "", "승인시각": "",
-            "_정렬점수": gap * weight if status == "검토" else (-0.5 if link_check == "필요" else -1),
+            "_그룹": {"검토": 0, "확정 구간": 1}.get(status, 2 if link_check == "필요" else 3),
+            "_기한": deadline, "_정렬점수": gap * weight,
         })
-    sheet = pd.DataFrame(sheets).sort_values("_정렬점수", ascending=False).drop(columns="_정렬점수")
+    # 정렬: 검토 대상 중 판단 기한이 임박한 순, 같은 기한이면 차이 물량과 FCST 신뢰도 이력 점수 순
+    sheet = (pd.DataFrame(sheets).sort_values(["_그룹", "_기한", "_정렬점수"], ascending=[True, True, False])
+             .drop(columns=["_그룹", "_기한", "_정렬점수"]))
     return sheet, ev
 
 
@@ -456,6 +481,9 @@ with pd.ExcelWriter(xlsx) as w:
         "모든 데이터는 가상이며 실제 고객, 거래, 수치가 아님",
         "LLM이 맡을 이벤트 추출과 질문 작성은 이 프로토타입에서 규칙으로 대신함",
         "사후평가의 승인값은 규칙으로 만든 모의 승인값임",
+        "판단 기한은 그레이드별 생산 확정과 원료 구매 리드타임을 가정한 값(G1 21일, G2 28일, G3 42일)으로 계산함",
+        "가격 지표는 이 프로토타입에 넣지 않았고, 선구매 여부는 최종 고객 생산지수 변화로만 질문함",
+        "초기 연결표는 주문에 최종 고객이 기록된 품목으로 시작함(실무에서는 그레이드 승인 이력과 영업 프로젝트 정보로 시작)",
         f"예측 모델: {'LightGBM' if HAS_LGB else 'scikit-learn GradientBoosting(LightGBM 미설치로 대체)'}",
     ]}).to_excel(w, sheet_name="안내", index=False)
     SUMMARY.to_excel(w, sheet_name="1_백테스트", index=False)
@@ -482,12 +510,16 @@ for _, r in SUMMARY[SUMMARY.구간 == "최종평가"].iterrows():
                  f"주모델(생산지수추가) {pct(r.WAPE_LGB_신호추가)}, 고객FCST {pct(r.WAPE_고객FCST)} | 구간 포함률 보정 전 {pct(r.구간포함률_보정전)} -> 보정 후 {pct(r['구간포함률_보정후(목표80%)'])}")
 lines.append("[2] 가상 최종 고객 생산지수 효과 (최종평가 구간)")
 for _, r in LINK_EFF.iterrows():
-    lines.append(f"  {r.최종고객연결}: 주문이력만 {pct(r.WAPE_LGB_주문이력만)} -> 신호추가 {pct(r.WAPE_LGB_신호추가)}")
+    lines.append(f"  {r.최종고객연결}: 주문이력만 {pct(r.WAPE_LGB_주문이력만)} -> 생산지수추가 {pct(r.WAPE_LGB_신호추가)}")
 n_review = (sheet1.상태 == "검토").sum()
-lines.append(f"[3] 1회차 검토표: 전체 {len(sheet1)}건 중 검토 {n_review}건, 정상 {len(sheet1) - n_review}건 (구간 보정 폭: " + ", ".join(f"{h}개월 {CALIB[h]:.1f}톤" for h in (1, 2, 3)) + ")")
-n_link_normal = int(((sheet1.상태 == "정상") & (sheet1.연결확인 == "필요")).sum())
+lines.append(f"[3] 1회차 검토표: 전체 {len(sheet1)}건 중 검토 {n_review}건, 확정 구간 알림 {(sheet1.상태 == '확정 구간').sum()}건, 정상 {(sheet1.상태 == '정상').sum()}건 (구간 보정 폭: " + ", ".join(f"{h}개월 {CALIB[h]:.1f}톤" for h in (1, 2, 3)) + ")")
+n_link_normal = int(((sheet1.상태 != "검토") & (sheet1.연결확인 == "필요")).sum())
+n_fixed = int((sheet1.상태 == "확정 구간").sum())
+n_prebuy = int(sheet1.확인질문.str.contains("선구매").sum())
+assert prebuy_question(0.01) and prebuy_question(0.10) is None and prebuy_question(np.nan) is None  # 규칙 자체 점검
+lines.append(f"  판단 기한: 검토일 기준 생산과 원료가 이미 확정된 구간 중 차이가 구간 폭 이내인 {n_fixed}건은 알림만 남김, 선구매 확인 질문 {n_prebuy}건 (이번 가상 데이터에는 접수 주문이 모델을 넘는 사례가 없어 0건이며, 규칙은 별도 점검 통과)")
 n_lowconf = int((sheet1.구간신뢰 == "구간 참고").sum())
-lines.append(f"  수량 검토와 별도로, 정상이지만 연결 확인 질문이 있는 행 {n_link_normal}건 (정상 요약에서도 질문 유지), 구간 참고 {n_lowconf}건")
+lines.append(f"  수량 검토와 별도로, 검토 대상이 아니지만 연결 확인 질문이 있는 행 {n_link_normal}건 (요약에서도 질문 유지), 구간 참고 {n_lowconf}건")
 late = [e["id"] for e in EVENTS if pd.Timestamp(e["published"]) > REVIEW_DATE]
 leaked = sorted(set(ev1.이벤트) & set(late))
 assert not leaked, f"검토일 이후 공개 근거가 사용됨: {leaked}"

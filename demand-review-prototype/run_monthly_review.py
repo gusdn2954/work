@@ -673,6 +673,35 @@ _n = EC_VIEW[EC_VIEW.최종고객명 != "미귀속(컴파운더, 대리점 경�
 EC_WAPE = {"고객FCST": F.wape(_n.실적_가상, _n.고객FCST), "에이전트제안값": F.wape(_n.실적_가상, _n.에이전트제안값)}
 UNATTR_SHARE = float(_v[_v.최종고객 == "미귀속"].독립예측.sum() / _v.독립예측.sum())
 
+# 회사 미특정 물량의 산업 추정: 거래처 단서(같은 거래처의 연결된 다른 품목), 없으면 전체 비율 (industry_mix.py, 정답 가림 검증 포함)
+import industry_mix as IM
+_unk = [i for i in _v.품목.unique() if not LINK1.get(i)]
+IM_SRC, IM_W = {}, {}
+for _i in _unk:
+    IM_W[_i], IM_SRC[_i] = IM.combined_mix(_i, REVIEW_ORIGIN, LINK1)
+_rows = []
+for r in _v.itertuples():
+    for k in IM.INDUSTRIES:
+        if LINK1.get(r.품목):
+            sh, how = float(r.산업 == k), "회사 특정"
+        else:
+            sh, how = IM_W[r.품목][k], "산업 추정(" + IM_SRC[r.품목] + ")"
+        if sh > 0:
+            _rows.append({"산업": k, "납기월": r.납기월, "특정수준": how, "고객FCST": r.고객FCST * sh, "독립예측": r.독립예측 * sh,
+                          "에이전트제안값": r.에이전트제안값 * sh, "실적_가상": r.실적 * sh,
+                          "정답_실적": r.실적 * IM.true_mix(r.품목)[k]})
+IND_EST = pd.DataFrame(_rows)
+IND_VIEW2 = IND_EST.groupby(["산업", "납기월"])[["고객FCST", "독립예측", "에이전트제안값", "실적_가상", "정답_실적"]].sum().reset_index()
+IND_LEVEL = IND_EST.groupby("특정수준").독립예측.sum() / IND_EST.독립예측.sum()
+# 산업 단위 3개월 오차(정답 = 품목 실적을 실제 산업 비중으로 나눈 값). 미특정을 빼고 볼 때와 비교
+_ex = _v[_v.최종고객 != "미귀속"].groupby(["산업", "납기월"]).실적.sum()
+_tr = IND_VIEW2.set_index(["산업", "납기월"]).정답_실적
+IND_ALLOC_ERR = {"미특정_제외": float((_tr - _ex.reindex(_tr.index).fillna(0)).abs().sum() / _tr.sum()),
+                 "산업추정_배분": float((IND_VIEW2.실적_가상 - IND_VIEW2.정답_실적).abs().sum() / IND_VIEW2.정답_실적.sum())}
+IND_WAPE = {"고객FCST": F.wape(IND_VIEW2.정답_실적, IND_VIEW2.고객FCST), "에이전트제안값": F.wape(IND_VIEW2.정답_실적, IND_VIEW2.에이전트제안값)}
+IND_VIEW2 = IND_VIEW2.round(1)
+IM_EVAL, IM_SUMM, IM_EXCL, IM_LAG = IM.run_eval(REVIEW_ORIGIN, F.LINK0)
+
 LOG = pd.DataFrame(hx.log)
 llm_log = LOG[LOG.권한 == "LLM"]
 n_units = len(REV2)
@@ -808,6 +837,9 @@ with pd.ExcelWriter(xlsx) as w:
     EC_VIEW.to_excel(w, sheet_name="23_최종고객별_수요", index=False)
     IND_VIEW.to_excel(w, sheet_name="24_산업별_수요", index=False)
     FAM_VIEW.to_excel(w, sheet_name="25_제품군x산업_다음달")
+    IND_VIEW2.to_excel(w, sheet_name="26_산업별_수요_추정배분", index=False)
+    IM_SUMM.round(3).to_excel(w, sheet_name="27_산업추정_정답가림검증", index=False)
+    IM_EVAL[IM_EVAL.방법.str.startswith("채택")].round(3).to_excel(w, sheet_name="27b_품목별_산업추정", index=False)
     ANSWERS.to_excel(w, sheet_name="9_답변해석_LLM", index=False)
     pd.DataFrame(CHANGELOG).to_excel(w, sheet_name="10_연결표_변경이력", index=False)
     REMIND.to_excel(w, sheet_name="11_재질문_에스컬레이션", index=False)
@@ -872,6 +904,10 @@ for _, r in EC_VIEW[EC_VIEW.납기월 == str(TARGETS[0])].iterrows():
     L.append(f"  {r.산업} {r.최종고객명} {r.납기월}: 품목 {r.품목수}, 고객FCST {r.고객FCST:.0f}톤, 독립예측 {r.독립예측:.0f}톤({r['80%범위(근사)']}), 제안값 {r.에이전트제안값:.0f}톤, 가상 실적 {r.실적_가상:.0f}톤")
 L.append("  다음 달 제안값, 제품군 x 산업(톤): " + "; ".join(f"{fam} " + ", ".join(f"{c} {v:.0f}" for c, v in row.items()) for fam, row in FAM_VIEW.iterrows()))
 L.append(f"  미귀속 물량 비중(독립예측 기준) {UNATTR_SHARE:.0%} | 최종 고객 단위 3개월 WAPE: 고객FCST {EC_WAPE['고객FCST']:.1%}, 제안값 {EC_WAPE['에이전트제안값']:.1%}")
+L.append("  특정 수준별 물량 비중: " + ", ".join(f"{k} {v:.0%}" for k, v in IND_LEVEL.items()))
+L.append(f"  산업 단위 3개월 실적 배분 오차: 미특정 제외 {IND_ALLOC_ERR['미특정_제외']:.1%} -> 산업 추정 배분 {IND_ALLOC_ERR['산업추정_배분']:.1%} | 산업 단위 3개월 WAPE: 고객FCST {IND_WAPE['고객FCST']:.1%}, 제안값 {IND_WAPE['에이전트제안값']:.1%}")
+_ims = IM_SUMM.set_index("방법")
+L.append("  산업 추정 정답 가림 검증(10월 기준, 최초 연결표): " + "; ".join(f"{m} 적중 {r.단일산업_1순위적중:.0%}, 배분오차 {r['산업배분_오차_최근6개월']:.1%}" for m, r in _ims.iterrows()) + f" | 미특정 제외 시 배분오차 {IM_EXCL:.1%}")
 L.append("")
 L.append("[4] 10월 회차 사후 평가 (가상 실적 2026-11 ~ 2027-01)")
 for _, r in POST.iterrows():

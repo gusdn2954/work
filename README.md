@@ -6,7 +6,7 @@ AI 도구(Codex, Claude)를 활용해 만들고 검증한 프로그램을 프로
 | --- | --- | --- |
 | **Codex 사용량 위젯** | Windows 바탕화면에서 Codex 사용량과 초기화 시각 확인 | [사용량 위젯 폴더 열기](./codex-usage-widget/) |
 | **내 공고 작업실** | 채용공고 수집, 전공, 학력, 경력 필터, 공고 묶음과 원문 확인 | [공고 프로그램 폴더 열기](./job-workbench/) |
-| **월간 수요검토 에이전트 프로토타입** | 수요예측 검토 흐름(독립 예측, 근거 분류, 검토표, 연결표 갱신)을 가상 데이터로 시연 | [프로토타입 폴더 열기](./demand-review-prototype/) |
+| **월간 수요검토 에이전트 프로토타입** | ML 수요예측과 AI 보정 FCST, 실제 LLM이 확인 질문을 쓰고 답변을 해석해 다음 행동을 고르는 월간 검토 루프를 가상 데이터로 시연 | [프로토타입 폴더 열기](./demand-review-prototype/) |
 
 ## Codex 사용량 위젯
 
@@ -22,4 +22,4 @@ AI 도구(Codex, Claude)를 활용해 만들고 검증한 프로그램을 프로
 
 ## 월간 수요검토 에이전트 프로토타입
 
-[demand-review-prototype](./demand-review-prototype/) 폴더에 Python 소스와 실행 안내가 있습니다. LOTTE AX Challenge 2026 예선 기획안을 검증하기 위한 것이며, **모든 데이터는 가상**입니다. 본선 준비에 맞춰 계속 갱신하는 진행 중 프로젝트입니다.
+[demand-review-prototype](./demand-review-prototype/) 폴더에 Python 소스, 실행 안내, 실행 결과, LLM 호출 기록(재생용)이 있습니다. ML이 숫자를, LLM이 질문과 답변 해석을, 하네스가 검증과 권한을 맡습니다. LOTTE AX Challenge 2026 예선 기획안을 검증하기 위한 것이며, **모든 데이터는 가상**입니다. 본선 준비에 맞춰 계속 갱신하는 진행 중 프로젝트입니다.

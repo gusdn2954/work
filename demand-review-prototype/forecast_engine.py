@@ -167,6 +167,8 @@ SELECT_ORIGINS = BT_ORIGINS[:-6]
 FINAL_ORIGINS = BT_ORIGINS[-6:]
 MODELS = ["기준(3개월평균)", "Croston-SBA", "LightGBM"]
 MIN_CALIB_N = 20
+CALIB_LEVEL = 0.8          # choose_level()이 모델 선택 구간에서 다시 정한다
+CALIB_CANDIDATES = (0.80, 0.85, 0.90)
 
 
 def run_backtest(link_table=LINK0):
@@ -213,7 +215,8 @@ def apply_champion(df, champ):
     return df
 
 
-def calib_params(bt, origin, h, pattern, champion):
+def calib_params(bt, origin, h, pattern, champion, level=None):
+    level = CALIB_LEVEL if level is None else level
     """origin 시점에 실적이 확인된(target < origin) 과거 오차만으로 구간 보정값 계산. 표본이 적으면 같은 h 전체로 넓힘"""
     past = bt[(bt.h == h) & (bt.target < origin)]
     p2 = past[past.pattern == pattern]
@@ -224,19 +227,19 @@ def calib_params(bt, origin, h, pattern, champion):
     if champion == "LightGBM":
         s = np.maximum(past.lgb_q10 - past.y, past.y - past.lgb_q90) / past.scale
         n = len(s)
-        return ("lgb", float(np.quantile(s, min(1.0, np.ceil((n + 1) * 0.8) / n)))), n
+        return ("lgb", float(np.quantile(s, min(1.0, np.ceil((n + 1) * level) / n)))), n
     col = {"기준(3개월평균)": "p_base", "Croston-SBA": "p_sba"}[champion]
     r = (past.y - past[col]) / past.scale
-    return ("resid", float(np.quantile(r, 0.1)), float(np.quantile(r, 0.9))), len(past)
+    return ("resid", float(np.quantile(r, (1 - level) / 2)), float(np.quantile(r, (1 + level) / 2))), len(past)
 
 
-def add_intervals(df, bt):
+def add_intervals(df, bt, level=None):
     lo, hi, ns = [], [], []
     cache = {}
     for _, r in df.iterrows():
         key = (r.origin, r.h, r.pattern, r.champion)
         if key not in cache:
-            cache[key] = calib_params(bt, r.origin, r.h, r.pattern, r.champion)
+            cache[key] = calib_params(bt, r.origin, r.h, r.pattern, r.champion, level)
         prm, n = cache[key]
         ns.append(n)
         if r.champion == "LightGBM":
@@ -305,3 +308,16 @@ def mes_lead_and_inventory():
 def color_mix(lots):
     w = lots.groupby(["그레이드", "색상"]).lot크기_톤.sum()
     return (w / w.groupby(level=0).transform("sum")).rename("색상비중").reset_index()
+
+
+def choose_level(bt):
+    """보정 수준을 모델 선택 구간에서만 고른다: 포함률이 80% 이상이 되는 가장 낮은 수준 (최종 평가 구간은 보지 않음)"""
+    sel = bt[bt.period == "모델선택"].copy()
+    rows = []
+    for lv in CALIB_CANDIDATES:
+        t = add_intervals(sel.copy(), bt, lv)
+        rows.append((lv, float(((t.y >= t.q10) & (t.y <= t.q90)).mean())))
+    for lv, cov in rows:
+        if cov >= 0.80:
+            return lv, rows
+    return CALIB_CANDIDATES[-1], rows

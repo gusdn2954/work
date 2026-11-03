@@ -10,10 +10,12 @@
   - 공개 뉴스(자유 문장), 영업 담당자 답변(자유 문장)과 정답 라벨 (LLM 정확도 평가용)
   - 2026년 11월 이후 숨은 변화: 완성차 A 감산, IT기기 E 신모델, 컴파운더 D09의 가격 기대 선구매
 """
+import os
+
 import numpy as np
 import pandas as pd
 
-SEED = 7
+SEED = int(os.environ.get("DEMAND_SEED", "7"))  # 안정성 검사 때 바꿔 가며 실행
 rng = np.random.default_rng(SEED)
 MONTHS = pd.period_range("2023-01", "2027-01", freq="M")
 
@@ -120,11 +122,11 @@ for _, it in ITEMS.iterrows():
         if it.pattern == "smooth":
             q = level * rng.lognormal(0, 0.08)
         elif it.pattern == "erratic":
-            q = level * rng.lognormal(0, 0.35)
+            q = level * rng.lognormal(0, 0.8)
         elif it.pattern == "intermittent":
             q = (level / 0.45) * rng.lognormal(0, 0.15) if rng.random() < 0.45 else 0.0
         else:  # lumpy
-            q = (level / 0.4) * rng.lognormal(0, 0.6) if rng.random() < 0.4 else 0.0
+            q = (level / 0.4) * rng.lognormal(0, 0.9) if rng.random() < 0.4 else 0.0
         ACT_BASE[(it["item"], m)] = q
         # 숨은 변화(11월 이후): 고객 FCST와 공개 지표는 아직 모름
         q2 = q
@@ -264,3 +266,31 @@ REPLIES = {
                    "gold": {"status": "답변완료", "end_customer": "E_D", "fact_type": "변화없음", "rate_pct": None, "start_month": None}},
     "D07-AB-H20": None,
 }
+
+
+# ---------------------------------------------------------------------------
+# 답변 해석 스트레스 테스트 (가상). 모호하거나 엉뚱한 답에서 LLM이 수량을 만들어내지 않는지 본다.
+# safe=True: 이 답으로는 수량 환산을 하면 안 되는 경우. status는 허용되는 값 목록.
+# ---------------------------------------------------------------------------
+STRESS = [
+    ("명확", "C사 냉장고 라인이 12월부터 10% 감산 확정입니다.", {"status": ["답변완료"], "fact_type": "감산", "rate_pct": -10, "start_month": "2026-12", "end_customer": "E_C"}, False),
+    ("명확", "B사 신차 라인 증설로 11월부터 저희 물량이 20% 늘어납니다.", {"status": ["답변완료"], "fact_type": "증산", "rate_pct": 20, "start_month": "2026-11", "end_customer": "E_B"}, False),
+    ("명확", "가격 인상 전에 1월분 30톤을 12월로 당겨 주문했습니다.", {"status": ["답변완료"], "fact_type": "선구매", "reduce": {"2027-01": 30}}, False),
+    ("명확", "고객 계획 그대로 갑니다. 변화 없습니다.", {"status": ["답변완료"], "fact_type": "변화없음"}, True),
+    ("명확", "이 물량은 IT기기 E사 태블릿 케이스용입니다.", {"status": ["답변완료"], "end_customer": "E_E"}, True),
+    ("모호", "10~15% 정도 줄 수도 있다는 얘기가 있는데 확정은 아닙니다.", {"status": ["보류"]}, True),
+    ("모호", "아마 좀 줄지 않을까 싶은데 정확히는 모르겠습니다.", {"status": ["보류"]}, True),
+    ("모호", "고객도 아직 생산 계획을 못 정했다고 합니다.", {"status": ["보류"]}, True),
+    ("모호", "물량은 5% 정도 늘어날 것 같은데 언제부터인지는 모릅니다.", {"status": ["보류", "답변완료"]}, True),
+    ("무관", "그 건은 제 담당이 아니라 영업2팀에 물어보셔야 합니다.", {"status": ["무관", "보류"]}, True),
+    ("무관", "요즘 운송비가 많이 올라서 힘들다고 하네요.", {"status": ["무관", "보류"]}, True),
+    ("다른 품목", "말씀하신 품목은 변화 없고, 옆 라인 PC 제품이 줄어든다고 합니다.", {"status": ["답변완료"], "fact_type": "변화없음"}, True),
+    ("여러 사실", "11월은 그대로이고 12월부터 8% 감산입니다.", {"status": ["답변완료"], "fact_type": "감산", "rate_pct": -8, "start_month": "2026-12"}, False),
+    ("숫자 오류", "11월부터 150% 감산이라고 합니다.", {"status": ["보류"]}, True),
+    ("보류", "내일 고객 미팅 후 알려드리겠습니다.", {"status": ["보류"]}, True),
+    ("상대 시점", "다음 달부터 15% 줄어듭니다.", {"status": ["답변완료"], "fact_type": "감산", "rate_pct": -15, "start_month": "2026-11"}, False),
+    ("상대 시점", "내년 1분기부터 10% 증산 예정입니다.", {"status": ["답변완료"], "fact_type": "증산", "rate_pct": 10, "start_month": "2027-01"}, False),
+    ("번복", "감산 얘기는 루머였고 실제로는 변화 없습니다.", {"status": ["답변완료"], "fact_type": "변화없음"}, True),
+    ("연결과 사실", "D사 세탁기용이고, 1월부터 12% 늘어납니다.", {"status": ["답변완료"], "fact_type": "증산", "rate_pct": 12, "start_month": "2027-01", "end_customer": "E_D"}, False),
+    ("영문", "Customer confirmed -10% from Dec.", {"status": ["답변완료"], "fact_type": "감산", "rate_pct": -10, "start_month": "2026-12"}, False),
+]

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-월간 수요검토 에이전트 프로토타입 v5 (가상 데이터)
+월간 수요검토 에이전트 프로토타입 v6 (가상 데이터)
 
 역할 분담
   ML(숫자)      : 독립 예측, 80% 구간, AI 보정 FCST, 수요 패턴별 모델 자동 선택, 변수 기여도
@@ -35,6 +35,7 @@ TARGETS = [REVIEW_ORIGIN + h for h in (1, 2, 3)]
 SPARSE_MA6 = 5.0
 PREBUY_SIG_CHG = 0.03   # 생산지수 전년 동월 대비 변화가 이보다 작은데 주문이 많으면 선구매 여부 질문
 SURGE_RATIO = 1.3
+QUESTION_CAP = 4       # 담당자 1명에게 한 회차에 묻는 품목 상한 (영업 부담 관리)
 MATERIAL_TONS = 10.0   # 구간 이탈이라도 차이 물량이 이 값 미만이면 검토 대신 알림
 SPARSE_PATTERNS = ("간헐", "덩어리", "신규")  # 월별 구간 비교가 의미 없는 패턴은 구간 참고
 EC_NAME = V.END_CUSTOMERS.set_index("code").name.to_dict()
@@ -56,6 +57,7 @@ def eq(a, b):
 BT = F.run_backtest()
 CHAMP, CHAMP_TABLE = F.select_champions(BT)
 BT = F.apply_champion(BT, CHAMP)
+F.CALIB_LEVEL, CALIB_TRIALS = F.choose_level(BT)   # 모델 선택 구간에서만 고름
 BT = F.add_intervals(BT, BT)
 BT_SUMMARY = F.backtest_summary(BT)
 PAT_SUMMARY = F.pattern_summary(BT)
@@ -384,6 +386,7 @@ def llm_answer(q, reply):
             f"보낸 질문: {q['question']}\n질문한 항목: {', '.join(q['ask_fields'])}\n답변: {reply}")
     vals = [H.quote_in(reply, "quote"), H.grounded_numbers(reply + " 2026 2027 11 12 1 01", ["rate_pct", "reduce_by_month"]),
             H.grounded_numbers(user, ["follow_up"]),
+            lambda o: ["변화율이 비현실적(절댓값 50% 초과): 수량 환산하지 말고 재질문"] if o.get("rate_pct") is not None and abs(o["rate_pct"]) > 50 else [],
             lambda o: ["월별 감소량은 양수여야 함"] if any(x["tons"] <= 0 for x in o.get("reduce_by_month") or []) else [],
             H.month_fmt("start_month"), answer_consistency,
             lambda o: [] if not o.get("end_customer") or EC_NAME[o["end_customer"]].split()[-1] in reply
@@ -422,15 +425,105 @@ for c in ["end_customer", "direction", "effect_from"]:
 EVL1 = hx.call("4 근거연결", "근거연결", events=EVENTS_OK, link_table=LINK0)
 REV1 = hx.call("5 검토표", "검토표작성", fc=FC1, ev_link=EVL1)
 
-print("[3] 확인 질문 작성 (LLM) ...")
+print("[3] 확인 질문 작성 (LLM, 담당자별 묶음) ...")
 ASK = REV1[(REV1.확인주제 != "-") & (REV1.상태 != "확정 구간")]
-ASK_ITEMS = list(dict.fromkeys(ASK.품목))
-QUESTIONS = hx.run_parallel(llm_question, [(it, ASK[ASK.품목 == it]) for it in ASK_ITEMS], workers=6)
-OUTBOX = []
-for q in QUESTIONS:
-    hx._log("7 발송", "사내발송", "사내발송", "실행", f"{q['받는사람']} <- {q['subject']}")
-    OUTBOX.append({"발송일": REVIEW_DATE.date(), "받는사람": q["받는사람"], "품목": q["품목"], "제목": q["subject"],
-                   "질문": q["question"], "요청항목": ", ".join(q["ask_fields"]), "작성": q["_meta"]["source"]})
+
+
+def item_priority(grp):
+    """질문 우선순위: 차이 물량(FCST 신뢰도 가중) + 선구매, 채택 근거, 연결 확인 가점"""
+    d = grp.거래처.iloc[0]
+    gap = float((grp.고객FCST - grp.독립예측).abs()[grp.상태 == "검토"].sum())
+    t = " / ".join(grp.확인주제)
+    return gap * (1 + abs(REL_MAP.get(d, 0))) + (30 if "선구매" in t else 0) + (20 if "변화가 이 그레이드" in t else 0) \
+        + (5 if "최종 고객과 적용 제품" in t else 0)
+
+
+PRIO = []
+for it in dict.fromkeys(ASK.품목):
+    g = ASK[ASK.품목 == it]
+    PRIO.append({"품목": it, "담당": g.담당.iloc[0], "우선순위점수": round(item_priority(g), 1),
+                 "가장빠른기한": next_deadline(g)})
+PRIO = pd.DataFrame(PRIO).sort_values(["담당", "우선순위점수"], ascending=[True, False])
+PRIO["순위"] = PRIO.groupby("담당").cumcount() + 1
+PRIO["처리"] = np.where(PRIO.순위 <= QUESTION_CAP, "이번 회차 질문", "다음 회차로 미룸 (AI 보정 FCST로 시작)")
+ASK_ITEMS = list(PRIO[PRIO.순위 <= QUESTION_CAP].품목)
+DEFERRED = list(PRIO[PRIO.순위 > QUESTION_CAP].품목)
+for it in DEFERRED:
+    hx._log("6 질문작성", "질문예산", "계산", "미룸", f"{it}: 담당자별 상한 {QUESTION_CAP}건 초과")
+
+BATCH_SYS = ("너는 수요계획팀 에이전트다. 영업 담당자 한 명에게 보낼 확인 요청 메시지 한 통을 쓴다. 품목마다 질문을 하나씩 쓰고, "
+             "주어진 사실과 숫자만 쓴다. 수량을 바꾸라고 요구하거나 권하지 않는다. 품목별 질문에는 그 품목의 판단 기한 날짜를 넣고 물음표로 끝낸다. "
+             "납기별 숫자는 고객 FCST와 모델만 쓴다. 기사는 예측 모델에 들어가지 않으므로 모델이 기사를 반영했다고 쓰지 않는다. "
+             "본문은 인사와 회신 기한 안내만 짧게 쓴다. " + NO_DOT)
+
+
+def batch_schema(items):
+    return {"type": "object", "additionalProperties": False, "properties": {
+        "subject": {"type": "string"}, "body": {"type": "string"},
+        "items": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
+            "item": {"type": "string", "enum": items}, "question": {"type": "string"},
+            "ask_fields": {"type": "array", "items": {"type": "string", "enum": [
+                "최종고객", "적용제품", "물량변화율", "시작월", "선구매여부", "취소이연", "거래처재고", "영향시점", "FCST근거"]}}},
+            "required": ["item", "question", "ask_fields"]}}},
+        "required": ["subject", "body", "items"]}
+
+
+def item_facts(item, grp):
+    lines = [f"[품목 {item}] 거래처 {grp['거래처'].iloc[0]}, 그레이드 {grp['그레이드'].iloc[0]}, 판단 기한 {next_deadline(grp)}"]
+    for _, r in grp.iterrows():
+        lines.append(f"- 납기 {r['납기월']}: 고객 FCST {r['고객FCST']}톤, 모델 {r['독립예측']}톤(구간 {r['구간하단']}~{r['구간상단']}), "
+                     f"접수 주문 {r['접수주문']}톤, 사유: {r['검토사유']}")
+    topics = sorted(set(" / ".join(grp["확인주제"]).split(" / ")) - {"-"})
+    ev_ids = sorted({t.split("의")[0] for t in topics if t.startswith("N")})
+    for e in EVENTS_OK:
+        if e["id"] in ev_ids:
+            lines.append(f"  관련 기사 {e['id']}: {e['text']}")
+    lines.append("  확인할 주제: " + "; ".join(topics))
+    return "\n".join(lines), topics
+
+
+def llm_batch(rep, items):
+    blocks, topics_map = [], {}
+    for it in items:
+        txt, tp = item_facts(it, ASK[ASK.품목 == it])
+        blocks.append(txt)
+        topics_map[it] = tp
+    user = f"받는 사람: {rep}\n회신 요청일: {ANSWER_DUE.date()}\n\n" + "\n\n".join(blocks)
+    bad = ["조정하세요", "변경하세요", "수정하세요", "로 확정", "줄이세요", "늘리세요", "·", "모델은 기사", "모델에 반영", "반영되어 있습니다"]
+
+    def v_items(o):
+        errs = []
+        got = [x["item"] for x in o.get("items", [])]
+        if sorted(got) != sorted(items):
+            errs.append(f"품목 누락 또는 중복: {got}")
+        for x in o.get("items", []):
+            if "?" not in x["question"]:
+                errs.append(f"{x['item']} 물음표 없음")
+            if len(x["question"]) > 450:
+                errs.append(f"{x['item']} 450자 초과")
+            errs += [f"{x['item']} 금지 표현 '{b}'" for b in bad if b in x["question"]]
+        return errs
+    vals = [H.grounded_numbers(user, ["subject", "body"]), v_items, H.forbidden("body", bad),
+            lambda o: H.grounded_numbers(user, ["q"])({"q": [x["question"] for x in o.get("items", [])]})]
+
+    def fb():
+        return {"subject": f"[수요검토] 확인 요청 {len(items)}건", "body": f"회신 요청일 {ANSWER_DUE.date()}",
+                "items": [{"item": it, "question": f"{it} 관련 확인 부탁드립니다: {'; '.join(topics_map[it])}? "
+                           f"판단 기한 {next_deadline(ASK[ASK.품목 == it])}", "ask_fields": ["FCST근거"]} for it in items]}
+    out, meta = hx.llm_task("6 질문작성", "질문묶음작성", BATCH_SYS, user, batch_schema(items), vals, fb, rep)
+    return rep, out, meta, topics_map
+
+
+BATCHES = hx.run_parallel(llm_batch, [(rep, list(g.품목)) for rep, g in PRIO[PRIO.순위 <= QUESTION_CAP].groupby("담당")], workers=6)
+QUESTIONS, OUTBOX = [], []
+for rep, out, meta, tmap in BATCHES:
+    hx._log("7 발송", "사내발송", "사내발송", "실행", f"{rep} <- {out['subject']} ({len(out['items'])}품목)")
+    OUTBOX.append({"발송일": REVIEW_DATE.date(), "받는사람": rep, "제목": out["subject"], "품목수": len(out["items"]),
+                   "본문": out["body"] + "\n\n" + "\n".join(f"{i + 1}. [{x['item']}] {x['question']}" for i, x in enumerate(out["items"])),
+                   "작성": meta["source"]})
+    for x in out["items"]:
+        QUESTIONS.append({"품목": x["item"], "받는사람": rep, "subject": out["subject"], "question": x["question"],
+                          "ask_fields": x["ask_fields"], "주제": "; ".join(tmap[x["item"]]), "_meta": meta})
 
 print("[4] 답변 수집과 해석 (LLM) ...")
 DEFAULT_REPLY = "특별히 들은 변화는 없습니다. 고객 계획대로 진행될 것 같습니다."
@@ -515,7 +608,7 @@ RESOLVED = set(ANSWERS[(ANSWERS.상태 == "답변완료") & (ANSWERS.다음행�
 REV2.loc[(REV2.상태 == "검토") & REV2.품목.isin(RESOLVED), "상태"] = "확인 완료(승인만)"
 REV2["제안근거"] = notes
 ans_map = ANSWERS.set_index("품목")
-REV2["질문답변"] = [("답변: " + str(ans_map.loc[i, "답변"])[:60]) if i in ans_map.index else "-" for i in REV2.품목]
+REV2["질문답변"] = [("답변: " + str(ans_map.loc[i, "답변"])) if i in ans_map.index else "-" for i in REV2.품목]
 
 print("[6] 예측 설명 (LLM) ...")
 EXP_ROWS = REV2[REV2.상태.isin(["검토", "확인 완료(승인만)"])]
@@ -568,7 +661,9 @@ EFF = pd.DataFrame([
     ("답변으로 확인돼 제안값 승인만 남은 단위", n_resolved, "건"),
     ("사람이 직접 판단할 단위 (답변 반영 후)", n_review2, f"건, 전체의 {n_review2 / n_units:.0%}"),
     ("확정 구간으로 알림만 남긴 단위", int((REV1.상태 == "확정 구간").sum()), "건"),
-    ("에이전트가 작성해 보낸 확인 질문", len(QUESTIONS), "건 (사람 작성 0건)"),
+    ("담당자별 묶음 메시지", len(OUTBOX), f"통, 질문 품목 {len(QUESTIONS)}개 (사람 작성 0건)"),
+    ("질문 예산으로 다음 회차로 미룬 품목", len(DEFERRED), f"품목, 담당자당 상한 {QUESTION_CAP}"),
+    ("예측 범위 보정 수준 (모델 선택 구간에서 선택)", F.CALIB_LEVEL, ""),
     ("도착한 답변을 해석해 정리", int(ANSWERS.상태.ne("무응답").sum()), "건 (사람 정리 0건)"),
     ("답변으로 갱신한 연결표", len(CHANGELOG), "건 (변경 이력 기록)"),
     ("답변 사실로 계산한 수량 제안 품목", len(FACTS), "품목"),
@@ -596,9 +691,43 @@ EFF.loc[EFF.지표.str.startswith("연결률"), "값"] = f"{RATE1:.1%} -> {RATE2
 assert not (set(EV_TABLE.id) & set(NEWS_LATE)), "검토일 이후 공개 근거가 사용됨"
 assert PERM_OK, "승인값 기록이 차단되지 않음"
 
+print("[6b] 답변 해석 스트레스 시험 (LLM) ...")
+STRESS_Q = {"question": "이 품목의 최종 고객, 물량 변화율, 시작 월을 확인 부탁드립니다. 판단 기한은 2026-10-14입니다. 알려주실 수 있을까요?",
+            "ask_fields": ["최종고객", "물량변화율", "시작월"]}
+st_out = hx.run_parallel(lambda i, c: llm_answer({**STRESS_Q, "품목": f"TEST-{i:02d}"}, c[1]), [(i, c) for i, c in enumerate(V.STRESS, 1)], workers=6)
+srows = []
+for (cat, text, gold, safe), (o, meta) in zip(V.STRESS, st_out):
+    row = {"유형": cat, "답변": text, "상태": o["status"], "사실": o["fact_type"], "변화율%": o["rate_pct"], "시작월": o["start_month"],
+           "월별감소": "; ".join(f"{x['month']} {x['tons']:g}톤" for x in o["reduce_by_month"]) or "-", "최종고객": o["end_customer"],
+           "다음행동": o["next_action"], "수량환산금지": safe, "해석": meta["source"]}
+    checks = [o["status"] in gold["status"]]
+    for k in ["fact_type", "rate_pct", "start_month", "end_customer"]:
+        if k in gold:
+            checks.append(eq(o[k], gold[k]))
+    if "reduce" in gold:
+        checks.append({x["month"]: abs(x["tons"]) for x in o["reduce_by_month"]} == gold["reduce"])
+    row["필드정답"] = all(checks)
+    row["필드정답률"] = sum(checks) / len(checks)
+    quant = "수량_환산" in o["next_action"]
+    row["위험(불확실한데 수량 환산)"] = bool(safe and quant)
+    row["확실한 답 수량 환산"] = bool((not safe) and quant)
+    srows.append(row)
+STRESS_T = pd.DataFrame(srows)
+ST_FIELD = float(STRESS_T.필드정답률.mean())
+ST_UNSAFE = int(STRESS_T["위험(불확실한데 수량 환산)"].sum())
+ST_SAFE_N = int(STRESS_T.수량환산금지.sum())
+ST_CONV = int(STRESS_T["확실한 답 수량 환산"].sum())
+ST_CONV_N = int((~STRESS_T.수량환산금지).sum())
+EFF = pd.concat([EFF, pd.DataFrame([
+    ("답변 해석 스트레스 시험 20건 필드 정답률", round(ST_FIELD, 3), ""),
+    ("불확실한 답을 수량으로 바꾼 건수", f"{ST_UNSAFE} / {ST_SAFE_N}", "건 (0이 목표)"),
+    ("확실한 답을 수량 제안으로 바꾼 건수", f"{ST_CONV} / {ST_CONV_N}", "건"),
+], columns=["지표", "값", "단위"])], ignore_index=True)
+
 print("[7] 월간 브리핑 (LLM) ...")
 p0 = POST.iloc[0]
-facts_txt = (f"기준일 2026-10-10. 검토 단위 {n_units}건 중 답변으로 확인돼 승인만 남은 단위 {n_resolved}건, 사람이 직접 판단할 단위 {n_review2}건. 확인 질문 {len(QUESTIONS)}건 발송, "
+facts_txt = (f"기준일 2026-10-10. 검토 단위 {n_units}건 중 답변으로 확인돼 승인만 남은 단위 {n_resolved}건, 사람이 직접 판단할 단위 {n_review2}건. "
+             f"담당자 {len(OUTBOX)}명에게 묶음 메시지 {len(OUTBOX)}통으로 {len(QUESTIONS)}품목 질문, 질문 상한으로 {len(DEFERRED)}품목은 다음 회차로 미룸. "
              f"답변 {int(ANSWERS.상태.ne('무응답').sum())}건 해석, 연결표 갱신 {len(CHANGELOG)}건, 수량 제안 {len(FACTS)}품목, "
              f"재질문 {len(REMIND)}건. 연결률 {RATE1:.1%}에서 {RATE2:.1%}. "
              f"판단 기한이 가장 빠른 검토 품목: " + ", ".join(f"{r.품목} {r.납기월}(기한 {r.판단기한})"
@@ -638,7 +767,10 @@ with pd.ExcelWriter(xlsx) as w:
         w, sheet_name="5_패턴별_모델선택", index=False)
     HIER.to_excel(w, sheet_name="6_계층별_오차", index=False)
     EV_TABLE.to_excel(w, sheet_name="7_근거구조화_LLM", index=False)
-    pd.DataFrame(OUTBOX).to_excel(w, sheet_name="8_질문발송함", index=False)
+    pd.DataFrame(OUTBOX).to_excel(w, sheet_name="8_질문발송함_담당자별", index=False)
+    PRIO.to_excel(w, sheet_name="8b_질문우선순위_예산", index=False)
+    STRESS_T.to_excel(w, sheet_name="18_답변해석_스트레스시험", index=False)
+    pd.DataFrame(CALIB_TRIALS, columns=["보정수준", "모델선택구간_포함률"]).to_excel(w, sheet_name="19_보정수준_선택", index=False)
     ANSWERS.to_excel(w, sheet_name="9_답변해석_LLM", index=False)
     pd.DataFrame(CHANGELOG).to_excel(w, sheet_name="10_연결표_변경이력", index=False)
     REMIND.to_excel(w, sheet_name="11_재질문_에스컬레이션", index=False)
@@ -655,7 +787,7 @@ def pct(x):
 
 
 fin = BT_SUMMARY[BT_SUMMARY.구간 == "최종평가"]
-L = ["월간 수요검토 에이전트 프로토타입 v5 (가상 데이터)",
+L = ["월간 수요검토 에이전트 프로토타입 v6 (가상 데이터)",
      f"예측 모델: {'LightGBM' if F.HAS_LGB else 'scikit-learn 대체'} | LLM: Claude Code CLI {H.LLM_MODEL} (모드 {H.MODE})", "",
      "[1] 수치 예측 (ML). 최종 평가: 모델 선택에 쓰지 않은 마지막 6개 시점"]
 for _, r in fin.iterrows():
@@ -663,6 +795,7 @@ for _, r in fin.iterrows():
              f"독립예측 {pct(r.WAPE_패턴별챔피언)}, AI보정FCST {pct(r.WAPE_AI보정FCST)} | 구간 포함률 {pct(r.구간포함률_보정전)} -> {pct(r['구간포함률_보정후(목표80%)'])}")
 L.append("  패턴별 챔피언: " + ", ".join(f"{r.패턴} {r.챔피언}" for _, r in CHAMP_TABLE.iterrows()))
 L.append("  계층별 1개월 앞 WAPE(독립예측): " + ", ".join(f"{r.계층} {pct(r.WAPE_챔피언)}" for _, r in HIER.iterrows()))
+L.append(f"  예측 범위 보정 수준 {F.CALIB_LEVEL:.2f} (모델 선택 구간 포함률: " + ", ".join(f"{a:.2f} -> {b:.1%}" for a, b in CALIB_TRIALS) + ")")
 L.append("  판단 기한용 MES 리드타임 80분위(일): " + ", ".join(f"{k} {v:g}" for k, v in LEAD80.items()))
 L.append("")
 L.append("[2] LLM 작업 (하네스 검증 포함)")
@@ -670,6 +803,7 @@ L.append(f"  근거 구조화 {len(EVENTS_OK)}건, 필드 정확도 {pct(ev_acc)
          f"{int(ANSWERS.상태.ne('무응답').sum())}건, 필드 정확도 {pct(ans_acc)} | 예측 설명 {len(exps)}건 | 브리핑 1건")
 L.append(f"  검증 1회 통과 {first_pass}건, 재시도 후 통과 {n_tasks - first_pass - n_fallback}건, 규칙 대체 {n_fallback}건")
 L.append(f"  비용 {hx.cost:.3f}달러, LLM 처리 시간 합계 {hx.llm_seconds:.0f}초, 새 호출 {hx.llm_calls}회 (나머지는 기록 재생)")
+L.append(f"  답변 해석 스트레스 시험 {len(STRESS_T)}건: 필드 정답률 {pct(ST_FIELD)}, 불확실한 답을 수량으로 바꾼 건 {ST_UNSAFE}/{ST_SAFE_N}, 확실한 답을 수량 제안으로 바꾼 건 {ST_CONV}/{ST_CONV_N}")
 L.append(f"  검토일 이후 공개 근거 {', '.join(NEWS_LATE)} 제외 확인, 승인값 기록 도구 차단 확인")
 if NOT_ASKED_DESIGNED:
     L.append(f"  참고: 답변이 준비됐지만 질문 대상이 아니었던 품목 {', '.join(NOT_ASKED_DESIGNED)}")
@@ -677,7 +811,8 @@ L.append("")
 L.append("[3] 업무 루프")
 L.append(f"  검토 단위 {n_units}건 -> 1회차 검토 {n_review1}건, 확정 구간 알림 {(REV1.상태 == '확정 구간').sum()}건")
 L.append(f"  선구매 확인 주제가 붙은 품목: {', '.join(sorted(set(REV1[REV1.확인주제.str.contains('선구매')].품목))) or '없음'}")
-L.append(f"  질문 {len(QUESTIONS)}건 발송 -> 답변 {int(ANSWERS.상태.ne('무응답').sum())}건 해석, 연결표 갱신 {len(CHANGELOG)}건, "
+L.append(f"  질문 예산: 담당자당 {QUESTION_CAP}품목, 묶음 메시지 {len(OUTBOX)}통으로 {len(QUESTIONS)}품목 질문, {len(DEFERRED)}품목은 다음 회차로 미룸")
+L.append(f"  질문 {len(QUESTIONS)}품목 발송 -> 답변 {int(ANSWERS.상태.ne('무응답').sum())}건 해석, 연결표 갱신 {len(CHANGELOG)}건, "
          f"수량 제안 {len(FACTS)}품목, 재질문 {len(REMIND)}건")
 L.append(f"  연결률 {pct(RATE1)} -> {pct(RATE2)} | 답변 반영 후: 승인만 남은 단위 {n_resolved}건, 직접 판단 {n_review2}건")
 for _, r in ANSWERS.iterrows():
@@ -695,6 +830,8 @@ for b in brief["bullets"]:
 L.append("")
 L.append(f"전체 실행 {ELAPSED:.0f}초. 상세: output/월간검토_결과_가상데이터.xlsx")
 PRUNED = hx.prune_records() if H.MODE in ("auto", "claude") and n_fallback == n_fallback else 0
+import review_ui
+review_ui.write_review_html(REV2, REVIEW_ORIGIN, os.path.join(OUT, "검토화면.html"))
 TEXT = "\n".join(L)
 with open(os.path.join(OUT, "실행_요약.txt"), "w", encoding="utf-8") as f:
     f.write(TEXT)

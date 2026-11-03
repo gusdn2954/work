@@ -114,6 +114,7 @@ BASE_COLS = ["item_code", "dtype_code", "fam_code", "h", "target_month", "lag1",
              "ma12", "zero_share12", "yoy", "accepted", "acc_ratio", "months_active", "pattern_code"]
 SIG_COLS = BASE_COLS + ["sig_last", "sig_chg3"]
 CORR_COLS = SIG_COLS + ["dist_code", "fcst", "fcst_ratio"]
+NOACC_COLS = [c for c in SIG_COLS if c not in ("accepted", "acc_ratio")]  # 비교 실험: 접수 주문을 뺀 모델
 
 
 def build(origins, link_table, with_target=True):
@@ -184,6 +185,7 @@ def run_backtest(link_table=LINK0):
         te["lgb_q10"] = np.minimum(fit_predict(tr, te, SIG_COLS, 0.1), te.p_lgb)
         te["lgb_q90"] = np.maximum(fit_predict(tr, te, SIG_COLS, 0.9), te.p_lgb)
         te["p_corr"] = fit_predict(tr, te, CORR_COLS)
+        te["p_lgb_noacc"] = fit_predict(tr, te, NOACC_COLS)
         out.append(te)
     bt = pd.concat(out, ignore_index=True)
     bt["scale"] = np.maximum(bt.ma12.fillna(bt.ma3).fillna(1), 1)
@@ -264,7 +266,8 @@ def backtest_summary(bt):
             s = bt[(bt.period == per) & (bt.h == h)]
             rows.append({"구간": per, "예측거리(개월)": h, "건수": len(s),
                          "WAPE_기준모델": wape(s.y, s.p_base), "WAPE_LGB_주문이력만": wape(s.y, s.p_lgb_hist),
-                         "WAPE_LGB_생산지수추가": wape(s.y, s.p_lgb), "WAPE_패턴별챔피언": wape(s.y, s.p_champ),
+                         "WAPE_LGB_생산지수추가": wape(s.y, s.p_lgb), "WAPE_LGB_접수주문제외": wape(s.y, s.p_lgb_noacc),
+                         "WAPE_패턴별챔피언": wape(s.y, s.p_champ),
                          "WAPE_고객FCST": wape(s.y, s.fcst), "WAPE_AI보정FCST": wape(s.y, s.p_corr),
                          "편향_고객FCST": bias(s.y, s.fcst), "편향_AI보정FCST": bias(s.y, s.p_corr),
                          "구간포함률_보정전": float(((s.y >= s.lgb_q10) & (s.y <= s.lgb_q90)).mean()),
@@ -321,3 +324,59 @@ def choose_level(bt):
         if cov >= 0.80:
             return lv, rows
     return CALIB_CANDIDATES[-1], rows
+
+
+# ---------------------------------------------------------------------------
+# 예외 선별 평가: FCST 범위 이탈 규칙이 "실제로 크게 틀린 고객 FCST"를 얼마나 잡는가
+# ---------------------------------------------------------------------------
+SPARSE = ("간헐", "덩어리", "신규")
+BIG_TONS, BIG_PCT = 10.0, 0.20
+
+
+REVIEW_SHARE = 0.25   # 검토 예산: 월별 구간 비교가 가능한 단위 중 고객 FCST와 AI 보정 FCST 차이가 큰 상위 25%
+
+
+def review_flag(df, share=REVIEW_SHARE, material=10.0, ref="p_corr"):
+    """검토 대상: 간헐, 덩어리, 신규를 뺀 단위 중 |고객 FCST - 기준값|이 상위 share 이상이고 중요도 기준 이상.
+    기준값은 AI 보정 FCST(2단계), FCST 이력이 없는 1단계에서는 독립 예측(ref="p_champ")"""
+    gap = (df.fcst - df[ref]).abs()
+    ok = ~df.pattern.isin(SPARSE)
+    thr = float(gap[ok].quantile(1 - share)) if ok.any() else np.inf
+    return ok & (gap >= max(thr, material)), thr
+
+
+def eval_flags(bt, shares=(0.10, 0.20, 0.25, 0.30, 0.40), seed=0):
+    """예외 선별 평가 (기간별, 예측 시점별로 선별 후 합산). 큰 오차 = 고객 FCST 오차 10톤 이상이면서 실적의 20% 이상.
+    규칙 비교는 모델 선택 구간에서 고르고 최종 평가 구간에서 확인한다."""
+    r = np.random.default_rng(seed)
+    rows = []
+    for per in ["모델선택", "최종평가"]:
+        f = bt[bt.period == per].copy()
+        f["err"] = (f.fcst - f.y).abs()
+        f["big"] = (f.err >= BIG_TONS) & (f.err >= BIG_PCT * f.y.clip(lower=1))
+        tot, nb = f.err.sum(), int(f.big.sum())
+        old = (~f.pattern.isin(SPARSE)) & ((f.fcst - f.p_champ).abs() >= 10) & ((f.fcst > f.q90) | (f.fcst < f.q10))
+
+        def stat(name, m, share=None):
+            m = m.astype(bool)
+            tp = int((m & f.big).sum())
+            rows.append({"구간": per, "규칙": name, "검토예산": share, "검토비율": float(m.mean()), "정밀도": tp / max(1, m.sum()),
+                         "재현율": tp / max(1, nb), "잡아낸오차비중": float(f.err[m].sum() / tot), "큰오차_비율": nb / len(f)})
+        stat("v6 규칙: 범위 이탈 + 10톤", old)
+        k = int(old.sum())
+        rnd = pd.Series(False, index=f.index); rnd[r.choice(f.index, k, replace=False)] = True
+        stat("비교: 같은 개수 무작위", rnd)
+        vol = pd.Series(False, index=f.index); vol[f.fcst.sort_values(ascending=False).index[:k]] = True
+        stat("비교: 같은 개수 물량 상위", vol)
+        for sh in shares:
+            m = pd.Series(False, index=f.index)
+            for o, g in f.groupby("origin"):
+                fl, _ = review_flag(g, sh)
+                m[g.index] = fl
+            stat("v7 규칙: AI 보정 차이 상위", m, sh)
+            m1 = pd.Series(False, index=f.index)
+            for o, g in f.groupby("origin"):
+                fl, _ = review_flag(g, sh, ref="p_champ")
+                m1[g.index] = fl
+            stat("1단계 규칙: 독립 예측 차이 상위", m1, sh)
+    return pd.DataFrame(rows)

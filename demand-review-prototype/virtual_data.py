@@ -145,6 +145,13 @@ FCST_BIAS = {"D01": 0.02, "D02": 0.22, "D03": 0.0, "D04": -0.12, "D05": 0.05, "D
 ACCEPT_SHARE = {1: 0.55, 2: 0.25, 3: 0.08}
 _FC, _AC = {}, {}
 
+# 데이터 모드: realistic(기본) = 거래처마다 다른 선주문 습관, 큰 월별 잡음, 접수 후 취소, 지난 실적에 끌리는 고객 FCST
+#              designed = v6까지의 단순 설계형 (비교용)
+DATA_MODE = os.environ.get("DEMAND_DATA", "realistic")
+_rr = np.random.default_rng(SEED + 1000)  # 현실형 요소 전용 난수 (설계형 결과를 흔들지 않게 분리)
+DIST_ACCEPT = {d: float(_rr.uniform(0.30, 0.75)) for d in DISTRIBUTORS.거래처}   # 거래처별 1개월 앞 접수 비율
+FCST_WEIGHT = {1: 0.7, 2: 0.5, 3: 0.35}  # 고객이 미래를 반영하는 비중, 나머지는 최근 3개월 실적 평균에 끌림
+
 
 def customer_fcst(item, target, origin):
     """고객 FCST: 고객이 아는 범위(ACT_BASE)에 거래처 편향과 잡음. D09의 11월 선구매 주문은 고객이 알고 FCST에 넣음"""
@@ -159,6 +166,11 @@ def customer_fcst(item, target, origin):
             _FC[key] = np.nan
         else:
             noise = rng.lognormal(0, 0.06 + 0.03 * h)
+            if DATA_MODE == "realistic":
+                recent = [ACT_BASE[(item, origin - k)] for k in range(1, 4)]
+                if np.any(~np.isnan(recent)):
+                    base = FCST_WEIGHT[h] * base + (1 - FCST_WEIGHT[h]) * float(np.nanmean(recent))
+                noise = _rr.lognormal(0, 0.10 + 0.04 * h)
             # 간헐, 덩어리 품목은 고객도 월별 시점을 맞히기 어려워 평균 수준을 제출
             pat = ITEMS.set_index("item").loc[item, "pattern"]
             if pat in ("intermittent", "lumpy"):
@@ -178,6 +190,12 @@ def accepted(item, target, origin):
             _AC[key] = np.nan
         else:
             share = np.clip(ACCEPT_SHARE[h] + rng.normal(0, 0.05), 0, 0.95)
+            if DATA_MODE == "realistic":
+                d = item.split("-")[0]
+                base_share = DIST_ACCEPT[d] * {1: 1.0, 2: 0.45, 3: 0.15}[h]
+                share = np.clip(base_share + _rr.normal(0, 0.12 * {1: 1.0, 2: 0.6, 3: 0.3}[h]), 0, 0.95)
+                if _rr.random() < 0.08:          # 접수 후 일부 취소 또는 이연: 접수량이 실제보다 부풀어 있음
+                    share = min(1.3, share * 1.6)
             if item == "D09-AB-G10" and str(target) == "2026-11" and str(origin) == "2026-10":
                 share = 0.9
             _AC[key] = a * share

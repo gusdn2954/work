@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-월간 수요검토 에이전트 프로토타입 v6 (가상 데이터)
+월간 수요검토 에이전트 프로토타입 v7 (가상 데이터)
 
 역할 분담
   ML(숫자)      : 독립 예측, 80% 구간, AI 보정 FCST, 수요 패턴별 모델 자동 선택, 변수 기여도
@@ -60,6 +60,7 @@ BT = F.apply_champion(BT, CHAMP)
 F.CALIB_LEVEL, CALIB_TRIALS = F.choose_level(BT)   # 모델 선택 구간에서만 고름
 BT = F.add_intervals(BT, BT)
 BT_SUMMARY = F.backtest_summary(BT)
+FLAG_EVAL = F.eval_flags(BT)
 PAT_SUMMARY = F.pattern_summary(BT)
 HIER = F.hierarchy_summary(BT)
 HIER = HIER[HIER.계층 != "계열"]  # 이 가상 데이터는 계열당 그레이드가 하나라 그레이드와 같음
@@ -170,19 +171,17 @@ def tool_link_events(events, link_table):
 
 def tool_review(fc, ev_link):
     rows = []
+    FLAG, _thr = F.review_flag(fc)  # 검토 예산: AI 보정 차이 상위 (모델 선택 구간에서 고른 규칙)
     for _, r in fc.iterrows():
         it, d, g = r["item"], r["item"].split("-")[0], r["item"].split("-", 1)[1]
         deadline = r.target.start_time - pd.Timedelta(days=int(np.ceil(LEAD80[g])))
         fixed = REVIEW_DATE > deadline
         low_conf = r.pattern in SPARSE_PATTERNS or (not np.isnan(r.ma6) and r.ma6 < SPARSE_MA6) or r.calib_n < F.MIN_CALIB_N
         reasons, topics = [], []
-        material = abs(r.고객FCST - r.p_champ) >= MATERIAL_TONS
-        if not low_conf and material and r.고객FCST > r.q90:
-            reasons.append("고객 FCST가 구간 상단 초과")
-            topics.append("FCST 상향 근거(신규 프로젝트, 재고 확충)")
-        elif not low_conf and material and r.고객FCST < r.q10:
-            reasons.append("고객 FCST가 구간 하단 미만")
-            topics.append("FCST 하향 사유(감산, 공급사 변경)")
+        if not low_conf and FLAG[r.name]:
+            side = "구간 상단 초과" if r.고객FCST > r.q90 else "구간 하단 미만" if r.고객FCST < r.q10 else "구간 안"
+            reasons.append(f"고객 FCST와 AI 보정값 차이 상위 {F.REVIEW_SHARE:.0%} ({side})")
+            topics.append("FCST 상향 근거(신규 프로젝트, 재고 확충)" if r.고객FCST > r.p_corr else "FCST 하향 사유(감산, 공급사 변경)")
         surge = r.accepted / (TYP_SHARE[int(r.h)] * r.ma6) if r.ma6 and r.ma6 > 0 else np.nan
         driver = r.sig_yoy if not np.isnan(r.sig_yoy) else r.market_yoy  # 최종 고객(없으면 시장) 생산지수 전년 동월 대비
         if r.pattern not in SPARSE_PATTERNS and not np.isnan(surge) and surge > SURGE_RATIO:
@@ -771,6 +770,7 @@ with pd.ExcelWriter(xlsx) as w:
     PRIO.to_excel(w, sheet_name="8b_질문우선순위_예산", index=False)
     STRESS_T.to_excel(w, sheet_name="18_답변해석_스트레스시험", index=False)
     pd.DataFrame(CALIB_TRIALS, columns=["보정수준", "모델선택구간_포함률"]).to_excel(w, sheet_name="19_보정수준_선택", index=False)
+    FLAG_EVAL.to_excel(w, sheet_name="20_예외선별_평가", index=False)
     ANSWERS.to_excel(w, sheet_name="9_답변해석_LLM", index=False)
     pd.DataFrame(CHANGELOG).to_excel(w, sheet_name="10_연결표_변경이력", index=False)
     REMIND.to_excel(w, sheet_name="11_재질문_에스컬레이션", index=False)
@@ -787,7 +787,7 @@ def pct(x):
 
 
 fin = BT_SUMMARY[BT_SUMMARY.구간 == "최종평가"]
-L = ["월간 수요검토 에이전트 프로토타입 v6 (가상 데이터)",
+L = ["월간 수요검토 에이전트 프로토타입 v7 (가상 데이터)",
      f"예측 모델: {'LightGBM' if F.HAS_LGB else 'scikit-learn 대체'} | LLM: Claude Code CLI {H.LLM_MODEL} (모드 {H.MODE})", "",
      "[1] 수치 예측 (ML). 최종 평가: 모델 선택에 쓰지 않은 마지막 6개 시점"]
 for _, r in fin.iterrows():
@@ -795,6 +795,14 @@ for _, r in fin.iterrows():
              f"독립예측 {pct(r.WAPE_패턴별챔피언)}, AI보정FCST {pct(r.WAPE_AI보정FCST)} | 구간 포함률 {pct(r.구간포함률_보정전)} -> {pct(r['구간포함률_보정후(목표80%)'])}")
 L.append("  패턴별 챔피언: " + ", ".join(f"{r.패턴} {r.챔피언}" for _, r in CHAMP_TABLE.iterrows()))
 L.append("  계층별 1개월 앞 WAPE(독립예측): " + ", ".join(f"{r.계층} {pct(r.WAPE_챔피언)}" for _, r in HIER.iterrows()))
+_fe = FLAG_EVAL[FLAG_EVAL.구간 == "최종평가"]
+_old = _fe[_fe.규칙.str.startswith("v6")].iloc[0]; _new = _fe[(_fe.규칙.str.startswith("v7")) & (_fe.검토예산 == F.REVIEW_SHARE)].iloc[0]
+_rnd = _fe[_fe.규칙.str.contains("무작위")].iloc[0]; _vol = _fe[_fe.규칙.str.contains("물량")].iloc[0]
+L.append(f"  예외 선별(최종평가, 큰 오차 = 고객 FCST 오차 10톤 이상이면서 20% 이상, 비율 {_new.큰오차_비율:.0%}): "
+         f"v7 규칙 검토 {_new.검토비율:.0%}에서 정밀도 {_new.정밀도:.0%}, 재현율 {_new.재현율:.0%}, 오차 {_new.잡아낸오차비중:.0%} 포착 | "
+         f"v6 규칙 {_old.정밀도:.0%}, {_old.잡아낸오차비중:.0%} | 무작위 {_rnd.정밀도:.0%}, {_rnd.잡아낸오차비중:.0%} | 물량 상위 {_vol.정밀도:.0%}, {_vol.잡아낸오차비중:.0%}")
+L.append(f"  접수 주문을 뺀 LightGBM 1개월 앞 WAPE {pct(fin.iloc[0].WAPE_LGB_접수주문제외)} (기준 모델 {pct(fin.iloc[0].WAPE_기준모델)})")
+L.append(f"  데이터 모드: {V.DATA_MODE}")
 L.append(f"  예측 범위 보정 수준 {F.CALIB_LEVEL:.2f} (모델 선택 구간 포함률: " + ", ".join(f"{a:.2f} -> {b:.1%}" for a, b in CALIB_TRIALS) + ")")
 L.append("  판단 기한용 MES 리드타임 80분위(일): " + ", ".join(f"{k} {v:g}" for k, v in LEAD80.items()))
 L.append("")

@@ -68,7 +68,7 @@ INV_SIM2 = F.inventory_sim2(BT, START_CHOICE, PLAN_K)
 PAT_SUMMARY = F.pattern_summary(BT)
 HIER = F.hierarchy_summary(BT)
 HIER = HIER[HIER.계층 != "계열"]  # 이 가상 데이터는 계열당 그레이드가 하나라 그레이드와 같음
-MES_G, MES_LOTS = F.mes_lead_and_inventory()
+MES_G, MES_LOTS = F.mes_lead_and_inventory(as_of=REVIEW_DATE)
 LEAD80 = MES_G.set_index("그레이드").리드타임_80분위.to_dict()   # 판단 기한 계산에 쓰는 MES 리드타임
 COLOR_MIX = F.color_mix(MES_LOTS)
 

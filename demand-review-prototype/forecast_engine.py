@@ -331,8 +331,11 @@ def hierarchy_summary(bt):
     return pd.DataFrame(rows)
 
 
-def mes_lead_and_inventory():
+def mes_lead_and_inventory(as_of=None):
+    """as_of(검토일) 이전에 출하가 끝난 lot만 쓴다. 검토일 뒤 출하 기록은 그 시점에 알 수 없다"""
     lots = V.MES_LOTS.copy()
+    if as_of is not None:
+        lots = lots[pd.to_datetime(lots.출하일) < pd.Timestamp(as_of)].copy()
     lots["리드타임"] = (pd.to_datetime(lots.출하일) - pd.to_datetime(lots.생산확정일)).dt.days
     g = lots.groupby("그레이드").agg(lot수=("lot", "count"), 리드타임_중앙값=("리드타임", "median"),
                                     리드타임_80분위=("리드타임", lambda x: float(np.quantile(x, 0.8))),

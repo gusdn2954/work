@@ -194,7 +194,9 @@ def run_backtest(link_table=LINK0):
         out.append(te)
     bt = pd.concat(out, ignore_index=True)
     bt["scale"] = np.maximum(bt.ma12.fillna(bt.ma3).fillna(1), 1)
-    bt["period"] = np.where(bt.origin.isin(FINAL_ORIGINS), "최종평가", "모델선택")
+    # 모델 선택 구간은 실적 월(target)까지 최종 평가 첫 시점 이전이어야 한다. 경계를 넘는 행은 선택과 평가 어디에도 쓰지 않는다
+    bt["period"] = np.where(bt.origin.isin(FINAL_ORIGINS), "최종평가",
+                            np.where(bt.target < FINAL_ORIGINS[0], "모델선택", "경계제외"))
     return bt
 
 

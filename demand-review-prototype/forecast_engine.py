@@ -264,6 +264,29 @@ def add_intervals(df, bt, level=None):
     return df
 
 
+def add_selected(bt, window=3):
+    """독립 예측(p_champ)과 AI 보정 FCST(p_corr)를 섞거나 고르는 규칙 3가지. 모두 origin 시점에 실적이 확인된 과거 오차만 쓴다.
+       p_avg: 두 값의 평균 / p_sel_item: 품목별 최근 window개 오차가 작은 쪽 / p_sel_dist: 거래처별 최근 6개월 오차가 작은 쪽"""
+    bt = bt.copy()
+    bt["p_avg"] = (bt.p_champ + bt.p_corr) / 2
+    bt["e_ind"] = (bt.y - bt.p_champ).abs()
+    bt["e_cor"] = (bt.y - bt.p_corr).abs()
+    bt["dist"] = bt.item.str[:3]
+    sel_i, sel_d = [], []
+    by_item = {k: g for k, g in bt.groupby(["item", "h"])}
+    by_dist = {k: g for k, g in bt.groupby(["dist", "h"])}
+    for r in bt.itertuples():
+        g = by_item[(r.item, r.h)]
+        p = g[g.target < r.origin].sort_values("target").tail(window)
+        sel_i.append(r.p_champ if len(p) and p.e_ind.sum() < p.e_cor.sum() else r.p_corr)
+        g = by_dist[(r.dist, r.h)]
+        p = g[(g.target < r.origin) & (g.target >= r.origin - 6)]
+        sel_d.append(r.p_champ if len(p) and p.e_ind.sum() < p.e_cor.sum() else r.p_corr)
+    bt["p_sel_item"] = sel_i
+    bt["p_sel_dist"] = sel_d
+    return bt.drop(columns=["e_ind", "e_cor", "dist"])
+
+
 def backtest_summary(bt):
     rows = []
     for per in ["모델선택", "최종평가"]:
@@ -274,6 +297,8 @@ def backtest_summary(bt):
                          "WAPE_LGB_생산지수추가": wape(s.y, s.p_lgb), "WAPE_LGB_접수주문제외": wape(s.y, s.p_lgb_noacc),
                          "WAPE_패턴별챔피언": wape(s.y, s.p_champ),
                          "WAPE_고객FCST": wape(s.y, s.fcst), "WAPE_AI보정FCST": wape(s.y, s.p_corr),
+                         **({"WAPE_두예측평균": wape(s.y, s.p_avg), "WAPE_품목별선택": wape(s.y, s.p_sel_item),
+                             "WAPE_거래처별선택": wape(s.y, s.p_sel_dist)} if "p_avg" in s else {}),
                          "편향_고객FCST": bias(s.y, s.fcst), "편향_AI보정FCST": bias(s.y, s.p_corr),
                          "구간포함률_보정전": float(((s.y >= s.lgb_q10) & (s.y <= s.lgb_q90)).mean()),
                          "구간포함률_보정후(목표80%)": float(((s.y >= s.q10) & (s.y <= s.q90)).mean())})

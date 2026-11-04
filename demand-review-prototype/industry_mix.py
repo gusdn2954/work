@@ -276,3 +276,90 @@ if __name__ == "__main__":
     print("시차", lag, "| 미특정 물량을 빼고 볼 때 산업 배분 오차", round(base_excl, 3))
     print(summ.round(3).to_string())
     print(ev[ev.방법.str.startswith("채택")][["품목", "연결표", "결합_근거", "1순위_적중", "비중_평균절대오차"] + [f"추정_{k}" for k in INDUSTRIES]].round(2).to_string())
+
+
+# ---------------------------------------------------------------------------
+# 스트레스 시험: 거래처가 여러 산업에 섞여 있으면 거래처 단서가 얼마나 떨어지는가
+# 단일 고객 품목의 실제 최종 고객을 확률 p로 다른 고객사로 바꾼 가상 연결 구조를 여러 번 만들고(연결된 품목의 연결표도 같이 바뀜),
+# 연결된 품목의 정답을 가린 채 산업 적중률과 최근 6개월 산업 배분 오차를 잰다. 주문 실적은 그대로 쓴다
+# ---------------------------------------------------------------------------
+def stress_test(origin=pd.Period("2026-10", "M"), mix_rates=(0.0, 0.2, 0.4, 0.6), n_draw=200, seed=0):
+    import forecast_engine as F
+    rng = np.random.default_rng(seed)
+    items = list(V.ITEMS.item)
+    it = V.ITEMS.set_index("item")
+    linked0 = {i: bool(F.LINK0.get(i)) for i in items}
+    ecs = list(EC.index)
+    vol = {i: _vol(i, origin) for i in items}
+    months = pd.period_range(origin - 5, origin, freq="M")
+    act = {i: sum(0.0 if np.isnan(V.ACT[(i, m)]) else V.ACT[(i, m)] for m in months) for i in items}
+    n_ind = V.END_CUSTOMERS.groupby("산업").size()
+    mixed_truth = {k: float(n_ind[k] / n_ind.sum()) for k in INDUSTRIES}
+    rows = []
+    for p in mix_rates:
+        for d in range(n_draw):
+            truth = {}
+            for i in items:
+                e = it.loc[i, "true_ec"]
+                if isinstance(e, str) and rng.random() < p:
+                    e = rng.choice([x for x in ecs if x != e])
+                truth[i] = e if isinstance(e, str) else None
+            link = {i: (truth[i] if linked0[i] else None) for i in items}
+            def tm(i):
+                return {k: float(EC.loc[truth[i], "산업"] == k) for k in INDUSTRIES} if truth[i] else mixed_truth
+            def est(i, lk):
+                acc = {k: 0.0 for k in INDUSTRIES}
+                for j, e in lk.items():
+                    if j != i and e and it.loc[j, "거래처"] == it.loc[i, "거래처"]:
+                        acc[EC.loc[e, "산업"]] += vol[j]
+                s = sum(acc.values())
+                if s > 0:
+                    return {k: v / s for k, v in acc.items()}, True
+                acc = {k: 0.0 for k in INDUSTRIES}
+                for j, e in lk.items():
+                    if j != i and e:
+                        acc[EC.loc[e, "산업"]] += vol[j]
+                s = sum(acc.values())
+                return {k: v / s for k, v in acc.items()}, False
+            # 정답 가림: 연결된 품목 하나씩 가리고 맞히기
+            hits, clue_used = [], []
+            for i in items:
+                if not link[i]:
+                    continue
+                w, used = est(i, link)
+                t = tm(i)
+                hits.append(float(max(w, key=w.get) == max(t, key=t.get)))
+                clue_used.append(used)
+            # 운영: 연결 안 된 품목 실적을 추정 비중으로 나눈 산업 합계 오차
+            truth_ind = {k: 0.0 for k in INDUSTRIES}
+            alloc = {k: 0.0 for k in INDUSTRIES}
+            alloc_prop = {k: 0.0 for k in INDUSTRIES}
+            base = {k: 0.0 for k in INDUSTRIES}
+            for j, e in link.items():
+                if e:
+                    base[EC.loc[e, "산업"]] += vol[j]
+            sb = sum(base.values())
+            base = {k: v / sb for k, v in base.items()}
+            for i in items:
+                t = tm(i)
+                for k in INDUSTRIES:
+                    truth_ind[k] += act[i] * t[k]
+                if link[i]:
+                    for k in INDUSTRIES:
+                        a = act[i] * float(EC.loc[link[i], "산업"] == k)
+                        alloc[k] += a
+                        alloc_prop[k] += a
+                else:
+                    w, _ = est(i, link)
+                    for k in INDUSTRIES:
+                        alloc[k] += act[i] * w[k]
+                        alloc_prop[k] += act[i] * base[k]
+            tot = sum(truth_ind.values())
+            rows.append({"섞임비율": p, "회차": d, "가림_적중": np.mean(hits),
+                         "배분오차_거래처단서": sum(abs(alloc[k] - truth_ind[k]) for k in INDUSTRIES) / tot,
+                         "배분오차_전체비율": sum(abs(alloc_prop[k] - truth_ind[k]) for k in INDUSTRIES) / tot})
+    r = pd.DataFrame(rows)
+    summ = r.groupby("섞임비율").agg(가림_적중=("가림_적중", "mean"), 배분오차_거래처단서=("배분오차_거래처단서", "mean"),
+                                    배분오차_전체비율=("배분오차_전체비율", "mean"))
+    summ["거래처단서가_나은_비율"] = r.assign(w=r.배분오차_거래처단서 < r.배분오차_전체비율).groupby("섞임비율").w.mean()
+    return summ.reset_index()
